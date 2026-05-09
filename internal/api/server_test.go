@@ -548,6 +548,29 @@ func TestCORSMiddlewareUsesUpdatedCORSAllowOrigins(t *testing.T) {
 	}
 }
 
+func TestCORSMiddlewareAllowsConfiguredOriginForManagementAPI(t *testing.T) {
+	server := newTestServerWithConfig(t, func(cfg *proxyconfig.Config) {
+		cfg.CORSAllowOrigins = []string{"http://localhost:5173"}
+		cfg.RemoteManagement.SecretKey = "test-secret"
+		cfg.RemoteManagement.AllowRemote = true
+	})
+
+	req := httptest.NewRequest(http.MethodOptions, "/v0/management/config", nil)
+	req.Header.Set("Origin", "http://localhost:5173")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	req.Header.Set("Access-Control-Request-Headers", "authorization,content-type")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusNoContent, rr.Body.String())
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:5173" {
+		t.Fatalf("Access-Control-Allow-Origin = %q", got)
+	}
+}
+
 func TestManagementRemoteRestrictionIgnoresForgedForwardedFor(t *testing.T) {
 	server := newTestServerWithConfig(t, func(cfg *proxyconfig.Config) {
 		cfg.RemoteManagement.SecretKey = "test-secret"

@@ -1305,7 +1305,7 @@ func corsMiddleware(cfgProvider func() *config.Config) gin.HandlerFunc {
 		// The panel is served from the same origin, so it does not need wildcard CORS.
 		if c != nil && c.Request != nil && c.Request.URL != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management") || strings.HasPrefix(path, "/manage") {
+			if strings.HasPrefix(path, "/manage") {
 				c.Next()
 				return
 			}
