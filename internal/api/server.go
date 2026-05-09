@@ -648,6 +648,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/usage/auth-file-quota-snapshot", s.mgmt.PostAuthFileQuotaSnapshot)
 		mgmt.GET("/usage/chart-data", s.mgmt.GetUsageChartData)
 		mgmt.GET("/usage/entity-stats", s.mgmt.GetEntityUsageStats)
+		mgmt.GET("/usage/entity-block-stats", s.mgmt.GetEntityUsageBlocks)
 		mgmt.GET("/config", s.mgmt.GetConfig)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)

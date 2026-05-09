@@ -134,6 +134,70 @@ func TestQuotaSnapshotPointsKeepFineGrainedSeries(t *testing.T) {
 	}
 }
 
+func TestQueryEntityBlockStatsReturnsRealTimeBuckets(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{})
+
+	now := time.Now().UTC().Truncate(time.Second)
+	blockDuration := 10 * time.Minute
+
+	InsertLog("sk-a", "", "gpt-5", "source-a", "channel-a", "auth-a", false, now.Add(-5*time.Minute), 10, 5, TokenStats{TotalTokens: 1}, "", "")
+	InsertLog("sk-a", "", "gpt-5", "source-a", "channel-a", "auth-a", true, now.Add(-15*time.Minute), 10, 5, TokenStats{TotalTokens: 1}, "", "")
+	InsertLog("sk-b", "", "gpt-5", "source-b", "channel-b", "auth-b", false, now.Add(-15*time.Minute), 10, 5, TokenStats{TotalTokens: 1}, "", "")
+	InsertLog("sk-a", "", "gpt-5", "source-a", "channel-a", "auth-a", false, now.Add(-6*time.Hour), 10, 5, TokenStats{TotalTokens: 1}, "", "")
+
+	sourceSeries, blockConfig, err := QueryEntityBlockStats("all", 7, "source", 20, blockDuration)
+	if err != nil {
+		t.Fatalf("QueryEntityBlockStats(source) error = %v", err)
+	}
+	if blockConfig.BlockCount != 20 {
+		t.Fatalf("block count = %d, want 20", blockConfig.BlockCount)
+	}
+	if blockConfig.DurationMs != blockDuration.Milliseconds() {
+		t.Fatalf("duration_ms = %d, want %d", blockConfig.DurationMs, blockDuration.Milliseconds())
+	}
+	if len(sourceSeries) != 2 {
+		t.Fatalf("source series len = %d, want 2", len(sourceSeries))
+	}
+
+	findSeries := func(items []EntityBlockSeries, entity string) *EntityBlockSeries {
+		t.Helper()
+		for i := range items {
+			if items[i].EntityName == entity {
+				return &items[i]
+			}
+		}
+		return nil
+	}
+
+	sourceA := findSeries(sourceSeries, "source-a")
+	if sourceA == nil {
+		t.Fatal("missing source-a series")
+	}
+	if sourceA.Success != 1 || sourceA.Failure != 1 {
+		t.Fatalf("source-a totals = %+v, want success=1 failure=1", sourceA)
+	}
+	lastBlock := sourceA.Blocks[len(sourceA.Blocks)-1]
+	prevBlock := sourceA.Blocks[len(sourceA.Blocks)-2]
+	if lastBlock.Success != 1 || lastBlock.Failure != 0 {
+		t.Fatalf("source-a last block = %+v, want success=1 failure=0", lastBlock)
+	}
+	if prevBlock.Success != 0 || prevBlock.Failure != 1 {
+		t.Fatalf("source-a previous block = %+v, want success=0 failure=1", prevBlock)
+	}
+
+	authSeries, _, err := QueryEntityBlockStats("all", 7, "auth_index", 20, blockDuration)
+	if err != nil {
+		t.Fatalf("QueryEntityBlockStats(auth_index) error = %v", err)
+	}
+	authA := findSeries(authSeries, "auth-a")
+	if authA == nil {
+		t.Fatal("missing auth-a series")
+	}
+	if authA.Success != 1 || authA.Failure != 1 {
+		t.Fatalf("auth-a totals = %+v, want success=1 failure=1", authA)
+	}
+}
+
 func TestQueryLogsSupportsSystemRequestLogFilterValue(t *testing.T) {
 	initTestUsageDB(t, config.RequestLogStorageConfig{})
 

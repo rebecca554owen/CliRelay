@@ -126,6 +126,30 @@ type QuotaSnapshotSeries struct {
 	Points        []QuotaSnapshotSeriesPoint `json:"points"`
 }
 
+type UsageBlockConfig struct {
+	WindowStartMs int64 `json:"window_start_ms"`
+	DurationMs    int64 `json:"duration_ms"`
+	BlockCount    int   `json:"block_count"`
+}
+
+type UsageBlockStat struct {
+	Success int64 `json:"success"`
+	Failure int64 `json:"failure"`
+}
+
+type EntityBlockSeries struct {
+	EntityName string           `json:"entity_name"`
+	Success    int64            `json:"success"`
+	Failure    int64            `json:"failure"`
+	Blocks     []UsageBlockStat `json:"blocks"`
+}
+
+type EntityBlockStatsResponse struct {
+	BlockConfig UsageBlockConfig    `json:"block_config"`
+	BySource    []EntityBlockSeries `json:"by_source"`
+	ByAuthIndex []EntityBlockSeries `json:"by_auth_index"`
+}
+
 const systemRequestLogFilterValue = "__system__"
 
 var (
@@ -1784,6 +1808,140 @@ func QueryEntityStats(apiKey string, days int, groupColumn string) ([]EntityStat
 		result = append(result, p)
 	}
 	return result, rows.Err()
+}
+
+func QueryEntityBlockStats(apiKey string, days int, groupColumn string, blockCount int, blockDuration time.Duration) ([]EntityBlockSeries, UsageBlockConfig, error) {
+	return QueryEntityBlockStatsAt(apiKey, days, groupColumn, blockCount, blockDuration, time.Now().UTC())
+}
+
+func QueryEntityBlockStatsAt(apiKey string, days int, groupColumn string, blockCount int, blockDuration time.Duration, now time.Time) ([]EntityBlockSeries, UsageBlockConfig, error) {
+	db := getDB()
+	if db == nil {
+		return []EntityBlockSeries{}, UsageBlockConfig{}, nil
+	}
+	if days < 1 {
+		days = 7
+	}
+	if groupColumn != "source" && groupColumn != "auth_index" {
+		return nil, UsageBlockConfig{}, fmt.Errorf("usage: invalid group column")
+	}
+	if blockCount <= 0 {
+		blockCount = 20
+	}
+	if blockDuration <= 0 {
+		blockDuration = 10 * time.Minute
+	}
+
+	now = now.UTC()
+	windowStart := now.Add(-time.Duration(blockCount) * blockDuration)
+	cutoff := CutoffStartUTC(days)
+	if cutoff.After(windowStart) {
+		windowStart = cutoff
+	}
+	blockConfig := UsageBlockConfig{
+		WindowStartMs: windowStart.UnixMilli(),
+		DurationMs:    blockDuration.Milliseconds(),
+		BlockCount:    blockCount,
+	}
+
+	var (
+		query string
+		args  []interface{}
+	)
+	if apiKey != "" && apiKey != "all" {
+		query = fmt.Sprintf(`
+			SELECT timestamp, failed, %s
+			FROM request_logs
+			WHERE timestamp >= ? AND api_key = ? AND %s != ''
+			ORDER BY timestamp ASC
+		`, groupColumn, groupColumn)
+		args = []interface{}{windowStart.Format(time.RFC3339Nano), apiKey}
+	} else {
+		query = fmt.Sprintf(`
+			SELECT timestamp, failed, %s
+			FROM request_logs
+			WHERE timestamp >= ? AND %s != ''
+			ORDER BY timestamp ASC
+		`, groupColumn, groupColumn)
+		args = []interface{}{windowStart.Format(time.RFC3339Nano)}
+	}
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, UsageBlockConfig{}, fmt.Errorf("usage: entity block stats query: %w", err)
+	}
+	defer rows.Close()
+
+	seriesByEntity := make(map[string]*EntityBlockSeries)
+	order := make([]string, 0)
+	windowDuration := time.Duration(blockCount) * blockDuration
+
+	for rows.Next() {
+		var (
+			timestampValue string
+			failed         bool
+			entityName     string
+		)
+		if err := rows.Scan(&timestampValue, &failed, &entityName); err != nil {
+			return nil, UsageBlockConfig{}, fmt.Errorf("usage: entity block stats scan: %w", err)
+		}
+		entityName = strings.TrimSpace(entityName)
+		if entityName == "" {
+			continue
+		}
+		parsed, ok := parseStoredTime(timestampValue)
+		if !ok {
+			continue
+		}
+		parsed = parsed.UTC()
+		if parsed.Before(windowStart) || parsed.After(now.Add(time.Second)) {
+			continue
+		}
+		age := now.Sub(parsed)
+		if age < 0 || age > windowDuration {
+			continue
+		}
+		index := blockCount - 1 - int(age/blockDuration)
+		if index < 0 || index >= blockCount {
+			continue
+		}
+		series := seriesByEntity[entityName]
+		if series == nil {
+			series = &EntityBlockSeries{
+				EntityName: entityName,
+				Blocks:     make([]UsageBlockStat, blockCount),
+			}
+			seriesByEntity[entityName] = series
+			order = append(order, entityName)
+		}
+		if failed {
+			series.Failure += 1
+			series.Blocks[index].Failure += 1
+		} else {
+			series.Success += 1
+			series.Blocks[index].Success += 1
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, UsageBlockConfig{}, err
+	}
+
+	result := make([]EntityBlockSeries, 0, len(order))
+	for _, entityName := range order {
+		if series := seriesByEntity[entityName]; series != nil {
+			result = append(result, *series)
+		}
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		leftTotal := result[i].Success + result[i].Failure
+		rightTotal := result[j].Success + result[j].Failure
+		if leftTotal != rightTotal {
+			return leftTotal > rightTotal
+		}
+		return strings.ToLower(result[i].EntityName) < strings.ToLower(result[j].EntityName)
+	})
+
+	return result, blockConfig, nil
 }
 
 func QueryDailyCallsByAuthIndexes(authIndexes []string, days int) ([]DailyCountPoint, error) {

@@ -695,6 +695,43 @@ func (h *Handler) GetEntityUsageStats(c *gin.Context) {
 	})
 }
 
+// GetEntityUsageBlocks returns time-bucketed statistics grouped by source or auth_index.
+func (h *Handler) GetEntityUsageBlocks(c *gin.Context) {
+	apiKey := strings.TrimSpace(c.Query("api_key"))
+	days := intQueryDefault(c, "days", 7)
+
+	const (
+		blockCount    = 20
+		blockDuration = 10 * time.Minute
+	)
+
+	now := time.Now().UTC()
+
+	sourceStats, blockConfig, err := usage.QueryEntityBlockStatsAt(apiKey, days, "source", blockCount, blockDuration, now)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if sourceStats == nil {
+		sourceStats = []usage.EntityBlockSeries{}
+	}
+
+	authIndexStats, _, err := usage.QueryEntityBlockStatsAt(apiKey, days, "auth_index", blockCount, blockDuration, now)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if authIndexStats == nil {
+		authIndexStats = []usage.EntityBlockSeries{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"block_config":  blockConfig,
+		"by_source":     sourceStats,
+		"by_auth_index": authIndexStats,
+	})
+}
+
 func (h *Handler) GetAuthFileGroupTrend(c *gin.Context) {
 	group := strings.ToLower(strings.TrimSpace(c.Query("group")))
 	if group == "" {
