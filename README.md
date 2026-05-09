@@ -17,7 +17,7 @@
 
 <p align="center">
   <a href="https://help.router-for.me/">📖 Docs</a> ·
-  <a href="https://github.com/kittors/codeProxy">🖥️ Management Panel</a> ·
+  <a href="https://github.com/rebecca554owen/codeProxy">🖥️ Management Panel</a> ·
   <a href="https://github.com/kittors/CliRelay/issues">🐛 Report Bug</a> ·
   <a href="https://github.com/kittors/CliRelay/pulls">✨ Request Feature</a>
 </p>
@@ -191,7 +191,7 @@ The gallery below uses the latest supplied screenshots, covering the current end
 | :----------------- |
 | <img src="docs/images/readme-showcase/system-info.png" width="100%" alt="System information page" /> |
 
-> 🔗 The runtime panel source is configurable via `remote-management.panel-github-repository`. The default repository is [kittors/codeProxy](https://github.com/kittors/codeProxy).
+> 🔗 The runtime panel source is configurable via `remote-management.panel-github-repository`. The default repository is [rebecca554owen/codeProxy](https://github.com/rebecca554owen/codeProxy).
 
 ## 🏗️ Supported Providers
 
@@ -295,7 +295,7 @@ http://localhost:8317/manage
 - Docker Compose deployments expose the panel at `/manage`.
 - The server can serve a bundled SPA directory or auto-fetch panel assets when needed.
 - This repository contains the hosting/update path for `/manage`; the standalone web panel source is maintained separately from the Go server code.
-- Make UI/interaction/copy changes in the panel source repository (default: `kittors/codeProxy`) and ship them via its release artifacts for the server to fetch.
+- Make UI/interaction/copy changes in the panel source repository (default: `rebecca554owen/codeProxy`) and ship them via its release artifacts for the server to fetch.
 - Terminal-first management is also available through `docker compose exec cli-proxy-api ./cli-proxy-api -tui`.
 - If you want to customize the panel asset source, set `remote-management.panel-github-repository`.
 

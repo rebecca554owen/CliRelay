@@ -10,7 +10,7 @@ services:
         COMMIT: ${COMMIT:-none}
         BUILD_DATE: ${BUILD_DATE:-unknown}
         UI_VERSION: ${UI_VERSION:-dev}
-        FRONTEND_REPOSITORY: ${FRONTEND_REPOSITORY:-https://github.com/kittors/codeProxy.git}
+        FRONTEND_REPOSITORY: ${FRONTEND_REPOSITORY:-https://github.com/rebecca554owen/codeProxy.git}
         FRONTEND_REF: ${FRONTEND_REF:-main}
         FRONTEND_COMMIT: ${FRONTEND_COMMIT:-}
     container_name: cli-proxy-api
