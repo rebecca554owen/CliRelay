@@ -7,7 +7,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
-func TestLookupAPIKeyUpstreamModel(t *testing.T) {
+func TestLookupAPIKeyUpstreamModelPool(t *testing.T) {
 	cfg := &internalconfig.Config{
 		GeminiKey: []internalconfig.GeminiKey{
 			{
@@ -58,9 +58,13 @@ func TestLookupAPIKeyUpstreamModel(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resolved := mgr.lookupAPIKeyUpstreamModel(tt.authID, tt.input)
-			if resolved != tt.want {
-				t.Errorf("lookupAPIKeyUpstreamModel(%q, %q) = %q, want %q", tt.authID, tt.input, resolved, tt.want)
+			resolved := mgr.lookupAPIKeyUpstreamModelPool(tt.authID, tt.input)
+			got := ""
+			if len(resolved) > 0 {
+				got = resolved[0]
+			}
+			if got != tt.want {
+				t.Errorf("lookupAPIKeyUpstreamModelPool(%q, %q) = %q, want %q", tt.authID, tt.input, got, tt.want)
 			}
 		})
 	}
@@ -83,8 +87,8 @@ func TestAPIKeyModelAlias_ConfigHotReload(t *testing.T) {
 	_, _ = mgr.Register(ctx, &Auth{ID: "a1", Provider: "gemini", Attributes: map[string]string{"api_key": "k"}})
 
 	// Initial alias
-	if resolved := mgr.lookupAPIKeyUpstreamModel("a1", "g25p"); resolved != "gemini-2.5-pro-exp-03-25" {
-		t.Fatalf("before reload: got %q, want %q", resolved, "gemini-2.5-pro-exp-03-25")
+	if resolved := mgr.lookupAPIKeyUpstreamModelPool("a1", "g25p"); len(resolved) == 0 || resolved[0] != "gemini-2.5-pro-exp-03-25" {
+		t.Fatalf("before reload: got %#v, want %q", resolved, "gemini-2.5-pro-exp-03-25")
 	}
 
 	// Hot reload with new alias
@@ -98,8 +102,8 @@ func TestAPIKeyModelAlias_ConfigHotReload(t *testing.T) {
 	})
 
 	// New alias should take effect
-	if resolved := mgr.lookupAPIKeyUpstreamModel("a1", "g25p"); resolved != "gemini-2.5-flash" {
-		t.Fatalf("after reload: got %q, want %q", resolved, "gemini-2.5-flash")
+	if resolved := mgr.lookupAPIKeyUpstreamModelPool("a1", "g25p"); len(resolved) == 0 || resolved[0] != "gemini-2.5-flash" {
+		t.Fatalf("after reload: got %#v, want %q", resolved, "gemini-2.5-flash")
 	}
 }
 
@@ -132,13 +136,13 @@ func TestAPIKeyModelAlias_MultipleProviders(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if resolved := mgr.lookupAPIKeyUpstreamModel(tt.authID, tt.input); resolved != tt.want {
-			t.Errorf("lookupAPIKeyUpstreamModel(%q, %q) = %q, want %q", tt.authID, tt.input, resolved, tt.want)
+		if resolved := mgr.lookupAPIKeyUpstreamModelPool(tt.authID, tt.input); len(resolved) == 0 || resolved[0] != tt.want {
+			t.Errorf("lookupAPIKeyUpstreamModelPool(%q, %q) = %v, want %q", tt.authID, tt.input, resolved, tt.want)
 		}
 	}
 }
 
-func TestApplyAPIKeyModelAlias(t *testing.T) {
+func TestResolveAPIKeyExecutionModels(t *testing.T) {
 	cfg := &internalconfig.Config{
 		GeminiKey: []internalconfig.GeminiKey{
 			{APIKey: "k", Models: []internalconfig.GeminiModel{{Name: "gemini-2.5-pro-exp-03-25", Alias: "g25p"}}},
@@ -175,10 +179,13 @@ func TestApplyAPIKeyModelAlias(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resolvedModel := mgr.applyAPIKeyModelAlias(tt.auth, tt.inputModel)
-
-			if resolvedModel != tt.wantModel {
-				t.Errorf("model = %q, want %q", resolvedModel, tt.wantModel)
+			resolvedModels := mgr.resolveAPIKeyExecutionModels(tt.auth, tt.inputModel)
+			got := ""
+			if len(resolvedModels) > 0 {
+				got = resolvedModels[0]
+			}
+			if got != tt.wantModel {
+				t.Errorf("model = %q, want %q", got, tt.wantModel)
 			}
 		})
 	}

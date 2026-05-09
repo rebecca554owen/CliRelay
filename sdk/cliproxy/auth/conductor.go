@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -172,8 +173,9 @@ type Manager struct {
 	oauthModelAlias atomic.Value
 
 	// apiKeyModelAlias caches resolved model alias mappings for API-key auths.
-	// Keyed by auth.ID, value is alias(lower) -> upstream model (including suffix).
-	apiKeyModelAlias atomic.Value
+	// Keyed by auth.ID, value is alias(lower) -> upstream model pool (including suffix).
+	apiKeyModelAlias        atomic.Value
+	apiKeyModelAliasOffsets map[string]map[string]int
 
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
@@ -205,16 +207,17 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:              store,
-		executors:          make(map[string]ProviderExecutor),
-		selector:           selector,
-		roundRobinSelector: roundRobinSelector,
-		fillFirstSelector:  fillFirstSelector,
-		hook:               hook,
-		auths:              make(map[string]*Auth),
-		providerOffsets:    make(map[string]int),
-		refreshSemaphore:   make(chan struct{}, refreshMaxConcurrency),
-		quotaProbeAfter:    make(map[string]time.Time),
+		store:                   store,
+		executors:               make(map[string]ProviderExecutor),
+		selector:                selector,
+		roundRobinSelector:      roundRobinSelector,
+		fillFirstSelector:       fillFirstSelector,
+		hook:                    hook,
+		auths:                   make(map[string]*Auth),
+		providerOffsets:         make(map[string]int),
+		apiKeyModelAliasOffsets: make(map[string]map[string]int),
+		refreshSemaphore:        make(chan struct{}, refreshMaxConcurrency),
+		quotaProbeAfter:         make(map[string]time.Time),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -296,44 +299,79 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
-func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
+func (m *Manager) lookupAPIKeyUpstreamModelPool(authID, requestedModel string) []string {
 	if m == nil {
-		return ""
+		return nil
 	}
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
-		return ""
+		return nil
 	}
 	requestedModel = strings.TrimSpace(requestedModel)
 	if requestedModel == "" {
-		return ""
+		return nil
 	}
 	table, _ := m.apiKeyModelAlias.Load().(apiKeyModelAliasTable)
 	if table == nil {
-		return ""
+		return nil
 	}
 	byAlias := table[authID]
 	if len(byAlias) == 0 {
-		return ""
+		return nil
 	}
 	key := strings.ToLower(thinking.ParseSuffix(requestedModel).ModelName)
 	if key == "" {
 		key = strings.ToLower(requestedModel)
 	}
-	resolved := strings.TrimSpace(byAlias[key])
-	if resolved == "" {
-		return ""
+	pool := byAlias[key]
+	if len(pool) == 0 {
+		return nil
 	}
-	// Preserve thinking suffix from the client's requested model unless config already has one.
 	requestResult := thinking.ParseSuffix(requestedModel)
-	if thinking.ParseSuffix(resolved).HasSuffix {
-		return resolved
+	ordered := m.nextAPIKeyAliasPoolModels(authID, key, pool)
+	out := make([]string, 0, len(ordered))
+	for _, resolved := range ordered {
+		resolved = strings.TrimSpace(resolved)
+		if resolved == "" {
+			continue
+		}
+		if thinking.ParseSuffix(resolved).HasSuffix {
+			out = append(out, resolved)
+			continue
+		}
+		if requestResult.HasSuffix && requestResult.RawSuffix != "" {
+			out = append(out, resolved+"("+requestResult.RawSuffix+")")
+			continue
+		}
+		out = append(out, resolved)
 	}
-	if requestResult.HasSuffix && requestResult.RawSuffix != "" {
-		return resolved + "(" + requestResult.RawSuffix + ")"
-	}
-	return resolved
+	return out
 
+}
+
+func (m *Manager) nextAPIKeyAliasPoolModels(authID, aliasKey string, pool []string) []string {
+	if len(pool) == 0 {
+		return nil
+	}
+	if len(pool) == 1 || m == nil {
+		return append([]string(nil), pool...)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	byAuth := m.apiKeyModelAliasOffsets[authID]
+	if byAuth == nil {
+		byAuth = make(map[string]int)
+		m.apiKeyModelAliasOffsets[authID] = byAuth
+	}
+	index := byAuth[aliasKey]
+	if index < 0 || index >= len(pool) {
+		index = 0
+	}
+	byAuth[aliasKey] = (index + 1) % len(pool)
+	ordered := make([]string, 0, len(pool))
+	ordered = append(ordered, pool[index:]...)
+	ordered = append(ordered, pool[:index]...)
+	return ordered
 }
 
 func (m *Manager) rebuildAPIKeyModelAliasFromRuntimeConfig() {
@@ -358,6 +396,7 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 	}
 
 	out := make(apiKeyModelAliasTable)
+	m.apiKeyModelAliasOffsets = make(map[string]map[string]int)
 	for _, auth := range m.auths {
 		if auth == nil {
 			continue
@@ -370,7 +409,7 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 			continue
 		}
 
-		byAlias := make(map[string]string)
+		byAlias := make(map[string][]string)
 		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
 		switch provider {
 		case "gemini":
@@ -419,7 +458,7 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 func compileAPIKeyModelAliasForModels[T interface {
 	GetName() string
 	GetAlias() string
-}](out map[string]string, models []T) {
+}](out map[string][]string, models []T) {
 	if out == nil {
 		return
 	}
@@ -433,11 +472,11 @@ func compileAPIKeyModelAliasForModels[T interface {
 		if aliasKey == "" {
 			aliasKey = strings.ToLower(alias)
 		}
-		// Config priority: first alias wins.
-		if _, exists := out[aliasKey]; exists {
-			continue
+		if aliasKey != "" {
+			if !slices.Contains(out[aliasKey], name) {
+				out[aliasKey] = append(out[aliasKey], name)
+			}
 		}
-		out[aliasKey] = name
 		// Also allow direct lookup by upstream name (case-insensitive), so lookups on already-upstream
 		// models remain a cheap no-op.
 		nameKey := strings.ToLower(thinking.ParseSuffix(name).ModelName)
@@ -445,8 +484,8 @@ func compileAPIKeyModelAliasForModels[T interface {
 			nameKey = strings.ToLower(name)
 		}
 		if nameKey != "" {
-			if _, exists := out[nameKey]; !exists {
-				out[nameKey] = name
+			if !slices.Contains(out[nameKey], name) {
+				out[nameKey] = append(out[nameKey], name)
 			}
 		}
 		// Preserve config suffix priority by seeding a base-name lookup when name already has suffix.
@@ -454,8 +493,8 @@ func compileAPIKeyModelAliasForModels[T interface {
 		if nameResult.HasSuffix {
 			baseKey := strings.ToLower(strings.TrimSpace(nameResult.ModelName))
 			if baseKey != "" {
-				if _, exists := out[baseKey]; !exists {
-					out[baseKey] = name
+				if !slices.Contains(out[baseKey], name) {
+					out[baseKey] = append(out[baseKey], name)
 				}
 			}
 		}
@@ -719,35 +758,43 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, util.ContextKeyRoundTripper, rt)
 		}
-		execReq := req
-		execReq.Model = rewriteModelForAuth(routeModel, auth)
-		execReq.Model = m.applyOAuthModelAlias(auth, execReq.Model)
-		execReq.Model = m.applyAPIKeyModelAlias(auth, execReq.Model)
-		resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
-		result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
-		if errExec != nil {
-			if errCtx := execCtx.Err(); errCtx != nil {
-				return cliproxyexecutor.Response{}, errCtx
-			}
-			result.Error = &Error{Message: errExec.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-				result.Error.HTTPStatus = se.StatusCode()
-			}
-			if ra := retryAfterFromError(errExec); ra != nil {
-				result.RetryAfter = ra
+		baseReq := req
+		baseReq.Model = rewriteModelForAuth(routeModel, auth)
+		baseReq.Model = m.applyOAuthModelAlias(auth, baseReq.Model)
+		executionModels := m.resolveAPIKeyExecutionModels(auth, baseReq.Model)
+		if len(executionModels) == 0 {
+			executionModels = []string{baseReq.Model}
+		}
+		for _, executionModel := range executionModels {
+			execReq := baseReq
+			execReq.Model = executionModel
+			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
+			if errExec != nil {
+				if errCtx := execCtx.Err(); errCtx != nil {
+					return cliproxyexecutor.Response{}, errCtx
+				}
+				result.Error = &Error{Message: errExec.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+					result.Error.HTTPStatus = se.StatusCode()
+				}
+				if ra := retryAfterFromError(errExec); ra != nil {
+					result.RetryAfter = ra
+				}
+				m.MarkResult(execCtx, result)
+				if isRequestInvalidError(errExec) {
+					return cliproxyexecutor.Response{}, errExec
+				}
+				lastErr = errExec
+				continue
 			}
 			m.MarkResult(execCtx, result)
-			if isRequestInvalidError(errExec) {
-				return cliproxyexecutor.Response{}, errExec
-			}
-			if singlePickRoute {
-				return cliproxyexecutor.Response{}, errExec
-			}
-			lastErr = errExec
-			continue
+			return resp, nil
 		}
-		m.MarkResult(execCtx, result)
-		return resp, nil
+		if singlePickRoute {
+			return cliproxyexecutor.Response{}, lastErr
+		}
+		continue
 	}
 }
 
@@ -779,25 +826,33 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, util.ContextKeyRoundTripper, rt)
 		}
-		execReq := req
-		execReq.Model = rewriteModelForAuth(routeModel, auth)
-		execReq.Model = m.applyOAuthModelAlias(auth, execReq.Model)
-		execReq.Model = m.applyAPIKeyModelAlias(auth, execReq.Model)
-		resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
-		if errExec != nil {
-			if errCtx := execCtx.Err(); errCtx != nil {
-				return cliproxyexecutor.Response{}, errCtx
-			}
-			if isRequestInvalidError(errExec) {
-				return cliproxyexecutor.Response{}, errExec
-			}
-			if singlePickRoute {
-				return cliproxyexecutor.Response{}, errExec
-			}
-			lastErr = errExec
-			continue
+		baseReq := req
+		baseReq.Model = rewriteModelForAuth(routeModel, auth)
+		baseReq.Model = m.applyOAuthModelAlias(auth, baseReq.Model)
+		executionModels := m.resolveAPIKeyExecutionModels(auth, baseReq.Model)
+		if len(executionModels) == 0 {
+			executionModels = []string{baseReq.Model}
 		}
-		return resp, nil
+		for _, executionModel := range executionModels {
+			execReq := baseReq
+			execReq.Model = executionModel
+			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
+			if errExec != nil {
+				if errCtx := execCtx.Err(); errCtx != nil {
+					return cliproxyexecutor.Response{}, errCtx
+				}
+				if isRequestInvalidError(errExec) {
+					return cliproxyexecutor.Response{}, errExec
+				}
+				lastErr = errExec
+				continue
+			}
+			return resp, nil
+		}
+		if singlePickRoute {
+			return cliproxyexecutor.Response{}, lastErr
+		}
+		continue
 	}
 }
 
@@ -829,66 +884,74 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, util.ContextKeyRoundTripper, rt)
 		}
-		execReq := req
-		execReq.Model = rewriteModelForAuth(routeModel, auth)
-		execReq.Model = m.applyOAuthModelAlias(auth, execReq.Model)
-		execReq.Model = m.applyAPIKeyModelAlias(auth, execReq.Model)
-		streamResult, errStream := executor.ExecuteStream(execCtx, auth, execReq, opts)
-		if errStream != nil {
-			if errCtx := execCtx.Err(); errCtx != nil {
-				return nil, errCtx
-			}
-			rerr := &Error{Message: errStream.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
-			result.RetryAfter = retryAfterFromError(errStream)
-			m.MarkResult(execCtx, result)
-			if isRequestInvalidError(errStream) {
-				return nil, errStream
-			}
-			if singlePickRoute {
-				return nil, errStream
-			}
-			lastErr = errStream
-			continue
+		baseReq := req
+		baseReq.Model = rewriteModelForAuth(routeModel, auth)
+		baseReq.Model = m.applyOAuthModelAlias(auth, baseReq.Model)
+		executionModels := m.resolveAPIKeyExecutionModels(auth, baseReq.Model)
+		if len(executionModels) == 0 {
+			executionModels = []string{baseReq.Model}
 		}
-		out := make(chan cliproxyexecutor.StreamChunk)
-		go func(streamCtx context.Context, streamAuth *Auth, streamProvider string, streamChunks <-chan cliproxyexecutor.StreamChunk) {
-			defer close(out)
-			var failed bool
-			forward := true
-			for chunk := range streamChunks {
-				if chunk.Err != nil && !failed {
-					failed = true
-					rerr := &Error{Message: chunk.Err.Error()}
-					if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
-						rerr.HTTPStatus = se.StatusCode()
+		for _, executionModel := range executionModels {
+			execReq := baseReq
+			execReq.Model = executionModel
+			streamResult, errStream := executor.ExecuteStream(execCtx, auth, execReq, opts)
+			if errStream != nil {
+				if errCtx := execCtx.Err(); errCtx != nil {
+					return nil, errCtx
+				}
+				rerr := &Error{Message: errStream.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
+					rerr.HTTPStatus = se.StatusCode()
+				}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
+				result.RetryAfter = retryAfterFromError(errStream)
+				m.MarkResult(execCtx, result)
+				if isRequestInvalidError(errStream) {
+					return nil, errStream
+				}
+				lastErr = errStream
+				continue
+			}
+			out := make(chan cliproxyexecutor.StreamChunk)
+			go func(streamCtx context.Context, streamAuth *Auth, streamProvider string, streamChunks <-chan cliproxyexecutor.StreamChunk) {
+				defer close(out)
+				var failed bool
+				forward := true
+				for chunk := range streamChunks {
+					if chunk.Err != nil && !failed {
+						failed = true
+						rerr := &Error{Message: chunk.Err.Error()}
+						if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
+							rerr.HTTPStatus = se.StatusCode()
+						}
+						m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: routeModel, Success: false, Error: rerr})
 					}
-					m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: routeModel, Success: false, Error: rerr})
+					if !forward {
+						continue
+					}
+					if streamCtx == nil {
+						out <- chunk
+						continue
+					}
+					select {
+					case <-streamCtx.Done():
+						forward = false
+					case out <- chunk:
+					}
 				}
-				if !forward {
-					continue
+				if !failed {
+					m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: routeModel, Success: true})
 				}
-				if streamCtx == nil {
-					out <- chunk
-					continue
-				}
-				select {
-				case <-streamCtx.Done():
-					forward = false
-				case out <- chunk:
-				}
-			}
-			if !failed {
-				m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: routeModel, Success: true})
-			}
-		}(execCtx, auth.Clone(), provider, streamResult.Chunks)
-		return &cliproxyexecutor.StreamResult{
-			Headers: streamResult.Headers,
-			Chunks:  out,
-		}, nil
+			}(execCtx, auth.Clone(), provider, streamResult.Chunks)
+			return &cliproxyexecutor.StreamResult{
+				Headers: streamResult.Headers,
+				Chunks:  out,
+			}, nil
+		}
+		if singlePickRoute {
+			return nil, lastErr
+		}
+		continue
 	}
 }
 
@@ -1029,23 +1092,23 @@ func rewriteModelForAuth(model string, auth *Auth) string {
 	return strings.TrimPrefix(model, needle)
 }
 
-func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) string {
+func (m *Manager) resolveAPIKeyExecutionModels(auth *Auth, requestedModel string) []string {
 	if m == nil || auth == nil {
-		return requestedModel
+		return []string{requestedModel}
 	}
 
 	kind, _ := auth.AccountInfo()
 	if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
-		return requestedModel
+		return []string{requestedModel}
 	}
 
 	requestedModel = strings.TrimSpace(requestedModel)
 	if requestedModel == "" {
-		return requestedModel
+		return []string{requestedModel}
 	}
 
-	// Fast path: lookup per-auth mapping table (keyed by auth.ID).
-	if resolved := m.lookupAPIKeyUpstreamModel(auth.ID, requestedModel); resolved != "" {
+	// Fast path: lookup per-auth alias pool table (keyed by auth.ID).
+	if resolved := m.lookupAPIKeyUpstreamModelPool(auth.ID, requestedModel); len(resolved) > 0 {
 		return resolved
 	}
 
@@ -1073,14 +1136,13 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 		upstreamModel = resolveUpstreamModelForOpenAICompatAPIKey(cfg, auth, requestedModel)
 	}
 
-	// Return upstream model if found, otherwise return requested model.
 	if upstreamModel != "" {
-		return upstreamModel
+		return []string{upstreamModel}
 	}
 	if builtIn := resolveBuiltInCodexModelAlias(auth, requestedModel); builtIn != "" {
-		return builtIn
+		return []string{builtIn}
 	}
-	return requestedModel
+	return []string{requestedModel}
 }
 
 // APIKeyConfigEntry is a generic interface for API key configurations.
@@ -1272,7 +1334,7 @@ func resolveUpstreamModelForOpenAICompatAPIKey(cfg *internalconfig.Config, auth 
 	return resolveModelAliasFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
 }
 
-type apiKeyModelAliasTable map[string]map[string]string
+type apiKeyModelAliasTable map[string]map[string][]string
 
 func resolveOpenAICompatConfig(cfg *internalconfig.Config, providerKey, compatName, authProvider string) *internalconfig.OpenAICompatibility {
 	if cfg == nil {
