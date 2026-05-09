@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/kittors/codeProxy"
+	DefaultPanelGitHubRepository = "https://github.com/rebecca554owen/codeProxy"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 	DefaultAutoUpdateChannel     = "main"
 	DefaultAutoUpdateRepository  = "https://github.com/kittors/CliRelay"
