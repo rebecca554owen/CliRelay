@@ -356,6 +356,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 	out := make([]*coreauth.Auth, 0)
 	for i := range cfg.OpenAICompatibility {
 		compat := &cfg.OpenAICompatibility[i]
+		if compat.Disabled {
+			continue
+		}
 		prefix := strings.TrimSpace(compat.Prefix)
 		providerName := strings.ToLower(strings.TrimSpace(compat.Name))
 		if providerName == "" {
@@ -367,6 +370,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 		createdEntries := 0
 		for j := range compat.APIKeyEntries {
 			entry := &compat.APIKeyEntries[j]
+			if entry.Disabled {
+				continue
+			}
 			key := strings.TrimSpace(entry.APIKey)
 			proxyURL := strings.TrimSpace(entry.ProxyURL)
 			proxyID := strings.TrimSpace(entry.ProxyID)

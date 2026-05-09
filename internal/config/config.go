@@ -649,6 +649,9 @@ type OpenAICompatibility struct {
 	// Name is the identifier for this OpenAI compatibility configuration.
 	Name string `yaml:"name" json:"name"`
 
+	// Disabled marks the whole compatibility provider as disabled without removing it.
+	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
+
 	// Priority controls selection preference when multiple providers or credentials match.
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
@@ -673,6 +676,9 @@ type OpenAICompatibility struct {
 type OpenAICompatibilityAPIKey struct {
 	// APIKey is the authentication key for accessing the external API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Disabled marks this API key entry as disabled without removing it.
+	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
@@ -1070,6 +1076,7 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
 		for j := range e.APIKeyEntries {
+			e.APIKeyEntries[j].APIKey = strings.TrimSpace(e.APIKeyEntries[j].APIKey)
 			e.APIKeyEntries[j].ProxyURL = strings.TrimSpace(e.APIKeyEntries[j].ProxyURL)
 			e.APIKeyEntries[j].ProxyID = strings.TrimSpace(e.APIKeyEntries[j].ProxyID)
 		}
