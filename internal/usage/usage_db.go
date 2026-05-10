@@ -14,6 +14,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const failedLogSummaryLimit = 4096
+
 // LogRow represents a single request log entry returned by QueryLogs.
 type LogRow struct {
 	ID              int64     `json:"id"`
@@ -414,6 +416,11 @@ func insertLog(apiKey, apiKeyName, model, source, channelName, authIndex string,
 
 	// Calculate cost based on model pricing
 	cost := CalculateCost(model, tokens.InputTokens, tokens.OutputTokens, tokens.CachedTokens)
+	metadataInputContent := ""
+	metadataOutputContent := ""
+	if failed && !requestLogStorage.StoreContent {
+		metadataOutputContent = requestLogFailureSummary(outputContent)
+	}
 
 	// 插入 request log 的事务由 usage 存储层统一拥有，不从外部 HTTP 请求透传 context，
 	// 以避免请求取消把已经选定要持久化的审计记录中断在半途。
@@ -426,13 +433,15 @@ func insertLog(apiKey, apiKeyName, model, source, channelName, authIndex string,
 	result, err := tx.Exec(
 		`INSERT INTO request_logs
 			(timestamp, api_key, api_key_name, model, source, channel_name, auth_index,
-			 failed, latency_ms, first_token_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, cost)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 failed, latency_ms, first_token_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, cost,
+			 input_content, output_content)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		timestamp.UTC().Format(time.RFC3339Nano),
 		apiKey, apiKeyName, model, source, channelName, authIndex,
 		failedInt, latencyMs, firstTokenMs,
 		tokens.InputTokens, tokens.OutputTokens, tokens.ReasoningTokens,
 		tokens.CachedTokens, tokens.TotalTokens, cost,
+		metadataInputContent, metadataOutputContent,
 	)
 	if err != nil {
 		_ = tx.Rollback()
@@ -463,6 +472,18 @@ func insertLog(apiKey, apiKeyName, model, source, channelName, authIndex string,
 	if tokenUsageCallback != nil && tokens.TotalTokens > 0 {
 		tokenUsageCallback(apiKey, tokens.TotalTokens)
 	}
+}
+
+func requestLogFailureSummary(outputContent string) string {
+	summary := strings.TrimSpace(outputContent)
+	if summary == "" {
+		return ""
+	}
+	runes := []rune(summary)
+	if len(runes) <= failedLogSummaryLimit {
+		return summary
+	}
+	return string(runes[:failedLogSummaryLimit]) + "...[truncated]"
 }
 
 // tokenUsageCallback is set by SetTokenUsageCallback to notify external

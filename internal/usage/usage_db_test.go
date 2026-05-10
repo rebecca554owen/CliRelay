@@ -437,6 +437,41 @@ func TestInsertLogStoresCompressedContentOutsideMainTable(t *testing.T) {
 	}
 }
 
+func TestInsertFailedLogStoresOutputSummaryWhenContentStorageDisabled(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{
+		StoreContent:           false,
+		ContentRetentionDays:   0,
+		CleanupIntervalMinutes: 1440,
+	})
+
+	timestamp := time.Now().UTC()
+	output := `{"error":{"message":"Unsupported value: 'reasoning_effort' does not support 'xhigh'."}}`
+
+	InsertLog("sk-test", "", "kimi-k2.6", "source", "kimi", "auth-1", true, timestamp, 321, 0, TokenStats{}, "", output)
+
+	result, err := QueryLogs(LogQueryParams{Page: 1, Size: 10, Days: 1})
+	if err != nil {
+		t.Fatalf("QueryLogs() error = %v", err)
+	}
+	if len(result.Items) != 1 {
+		t.Fatalf("expected 1 log row, got %d", len(result.Items))
+	}
+	if !result.Items[0].Failed {
+		t.Fatalf("expected failed log")
+	}
+	if !result.Items[0].HasContent {
+		t.Fatalf("expected failed summary to make content available")
+	}
+
+	content, err := QueryLogContent(result.Items[0].ID)
+	if err != nil {
+		t.Fatalf("QueryLogContent() error = %v", err)
+	}
+	if content.OutputContent != output {
+		t.Fatalf("OutputContent = %q, want %q", content.OutputContent, output)
+	}
+}
+
 func TestMigrateLegacyContentBatchMovesContentOutOfMainTable(t *testing.T) {
 	initTestUsageDB(t, config.RequestLogStorageConfig{
 		StoreContent:           true,

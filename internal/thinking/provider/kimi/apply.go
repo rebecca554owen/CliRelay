@@ -1,12 +1,12 @@
 // Package kimi implements thinking configuration for Kimi (Moonshot AI) models.
 //
-// Kimi models use the OpenAI-compatible reasoning_effort format with discrete levels
-// (low/medium/high). The provider strips any existing thinking config and applies
-// the unified ThinkingConfig in OpenAI format.
+// Kimi models use the OpenAI-compatible reasoning_effort format with discrete
+// levels (minimal/low/medium/high).
 package kimi
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -17,7 +17,7 @@ import (
 // Applier implements thinking.ProviderApplier for Kimi models.
 //
 // Kimi-specific behavior:
-//   - Output format: reasoning_effort (string: low/medium/high)
+//   - Output format: reasoning_effort (string: minimal/low/medium/high)
 //   - Uses OpenAI-compatible format
 //   - Supports budget-to-level conversion
 type Applier struct{}
@@ -60,8 +60,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		}
 		effort = string(config.Level)
 	case thinking.ModeNone:
-		// Kimi uses "none" to disable thinking
-		effort = string(thinking.LevelNone)
+		return removeKimiReasoningEffort(body), nil
 	case thinking.ModeBudget:
 		// Convert budget to level using threshold mapping
 		level, ok := thinking.ConvertBudgetToLevel(config.Budget)
@@ -78,6 +77,10 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 
 	if effort == "" {
 		return body, nil
+	}
+	effort = normalizeKimiReasoningEffort(effort)
+	if effort == "" {
+		return removeKimiReasoningEffort(body), nil
 	}
 
 	result, err := sjson.SetBytes(body, "reasoning_effort", effort)
@@ -101,10 +104,7 @@ func applyCompatibleKimi(body []byte, config thinking.ThinkingConfig) ([]byte, e
 		}
 		effort = string(config.Level)
 	case thinking.ModeNone:
-		effort = string(thinking.LevelNone)
-		if config.Level != "" {
-			effort = string(config.Level)
-		}
+		return removeKimiReasoningEffort(body), nil
 	case thinking.ModeAuto:
 		effort = string(thinking.LevelAuto)
 	case thinking.ModeBudget:
@@ -118,9 +118,36 @@ func applyCompatibleKimi(body []byte, config thinking.ThinkingConfig) ([]byte, e
 		return body, nil
 	}
 
+	effort = normalizeKimiReasoningEffort(effort)
+	if effort == "" {
+		return removeKimiReasoningEffort(body), nil
+	}
+
 	result, err := sjson.SetBytes(body, "reasoning_effort", effort)
 	if err != nil {
 		return body, fmt.Errorf("kimi thinking: failed to set reasoning_effort: %w", err)
 	}
 	return result, nil
+}
+
+func normalizeKimiReasoningEffort(effort string) string {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	switch effort {
+	case string(thinking.LevelMinimal), string(thinking.LevelLow), string(thinking.LevelMedium), string(thinking.LevelHigh):
+		return effort
+	case string(thinking.LevelAuto), string(thinking.LevelXHigh):
+		return string(thinking.LevelHigh)
+	case string(thinking.LevelNone):
+		return ""
+	default:
+		return effort
+	}
+}
+
+func removeKimiReasoningEffort(body []byte) []byte {
+	result, err := sjson.DeleteBytes(body, "reasoning_effort")
+	if err != nil {
+		return body
+	}
+	return result
 }
