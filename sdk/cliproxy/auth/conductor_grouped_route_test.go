@@ -5,8 +5,10 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
@@ -114,6 +116,35 @@ func (e *invalidModelExecutor) Execute(ctx context.Context, auth *Auth, req clip
 	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
 }
 
+type kimiAccountAvailabilityExecutor struct {
+	sequenceExecutor
+}
+
+func (e *kimiAccountAvailabilityExecutor) Identifier() string { return "kimi" }
+
+func (e *kimiAccountAvailabilityExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	_ = ctx
+	_ = req
+	_ = opts
+
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+
+	e.mu.Lock()
+	e.execAuth = append(e.execAuth, authID)
+	e.mu.Unlock()
+
+	if authID == "auth-a" {
+		return cliproxyexecutor.Response{}, &Error{
+			Message:    `{"error":{"message":"We're unable to verify your membership benefits at this time. Please ensure your membership is active.","type":"invalid_request_error"}}`,
+			HTTPStatus: http.StatusBadRequest,
+		}
+	}
+	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
+}
+
 func registerGroupedRouteTestAuths(t *testing.T, manager *Manager) {
 	t.Helper()
 
@@ -136,6 +167,27 @@ func registerGroupedRouteTestAuths(t *testing.T, manager *Manager) {
 		if _, err := manager.Register(context.Background(), auth); err != nil {
 			t.Fatalf("register %s: %v", auth.ID, err)
 		}
+	}
+}
+
+func registerKimiRouteTestAuths(t *testing.T, manager *Manager) {
+	t.Helper()
+
+	reg := registry.GetGlobalRegistry()
+	for _, auth := range []*Auth{
+		{ID: "auth-a", Provider: "kimi", Status: StatusActive},
+		{ID: "auth-b", Provider: "kimi", Status: StatusActive},
+	} {
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register %s: %v", auth.ID, err)
+		}
+		reg.RegisterClient(auth.ID, "kimi", []*registry.ModelInfo{
+			{ID: "kimi-for-coding", Created: time.Now().Unix()},
+			{ID: "kimi-k2.6", Created: time.Now().Unix()},
+		})
+		t.Cleanup(func(id string) func() {
+			return func() { reg.UnregisterClient(id) }
+		}(auth.ID))
 	}
 }
 
@@ -207,6 +259,43 @@ func TestManagerExecute_ModelNotSupportedBadRequestDoesNotFailOver(t *testing.T)
 	}
 	if calls[0] != "auth-a" {
 		t.Fatalf("expected first auth only, got %v", calls)
+	}
+}
+
+func TestManagerExecute_KimiAccountInvalidRequestFailsOver(t *testing.T) {
+	t.Parallel()
+
+	executor := &kimiAccountAvailabilityExecutor{}
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(executor)
+	registerKimiRouteTestAuths(t, manager)
+
+	resp, err := manager.Execute(context.Background(), []string{"kimi"}, cliproxyexecutor.Request{Model: "kimi-for-coding"}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if string(resp.Payload) != "ok" {
+		t.Fatalf("Execute() payload = %q, want %q", string(resp.Payload), "ok")
+	}
+
+	calls := executor.Calls()
+	if len(calls) != 2 {
+		t.Fatalf("expected failover after Kimi account error, got %v", calls)
+	}
+	if calls[0] != "auth-a" || calls[1] != "auth-b" {
+		t.Fatalf("expected failover sequence [auth-a auth-b], got %v", calls)
+	}
+
+	updated, ok := manager.GetByID("auth-a")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth-a to remain registered")
+	}
+	blocked, reason, _ := isAuthBlockedForModel(updated, "kimi-k2.6", time.Now())
+	if !blocked {
+		t.Fatalf("expected Kimi account error to block other aliases")
+	}
+	if reason != blockReasonOther {
+		t.Fatalf("block reason = %v, want temporary block", reason)
 	}
 }
 

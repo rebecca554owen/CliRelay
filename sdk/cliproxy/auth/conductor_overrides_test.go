@@ -204,6 +204,16 @@ func TestManager_MarkResult_CoolsKimiMembershipErrors(t *testing.T) {
 	if reason != blockReasonOther {
 		t.Fatalf("block reason = %v, want temporary block", reason)
 	}
+	blockedOtherModel, reasonOtherModel, _ := isAuthBlockedForModel(updated, "kimi-k2.6", time.Now())
+	if !blockedOtherModel {
+		t.Fatalf("expected Kimi account cooldown to block other model aliases")
+	}
+	if reasonOtherModel != blockReasonOther {
+		t.Fatalf("other model block reason = %v, want temporary block", reasonOtherModel)
+	}
+	if wait := time.Until(updated.NextRetryAfter); wait < 25*time.Minute || wait > 31*time.Minute {
+		t.Fatalf("auth NextRetryAfter wait = %v, want about 30m", wait)
+	}
 }
 
 func TestManager_MarkResult_CoolsKimiUsageLimitAsQuota(t *testing.T) {

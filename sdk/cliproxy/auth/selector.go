@@ -692,6 +692,13 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 			return true, blockReasonCooldown, next
 		}
 	}
+	if auth.Unavailable && auth.NextRetryAfter.After(now) && accountUnavailableBlocksAllModels(auth) {
+		next := auth.NextRetryAfter
+		if next.Before(now) {
+			next = now
+		}
+		return true, blockReasonOther, next
+	}
 
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
@@ -743,4 +750,17 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return true, blockReasonOther, next
 	}
 	return false, blockReasonNone, time.Time{}
+}
+
+func accountUnavailableBlocksAllModels(auth *Auth) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "kimi") {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(auth.StatusMessage))
+	if auth.LastError != nil {
+		message += " " + strings.ToLower(strings.TrimSpace(auth.LastError.Message))
+	}
+	return strings.Contains(message, "unauthorized") ||
+		strings.Contains(message, "transient upstream error") ||
+		isKimiAccountAvailabilityMessage(message)
 }
