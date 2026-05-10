@@ -145,6 +145,9 @@ func TestCodexExecutorExecuteImageGeneration(t *testing.T) {
 	for {
 		select {
 		case record := <-usagePlugin.records:
+			if record.AuthID != auth.ID {
+				continue
+			}
 			if record.Model != "gpt-image-2" {
 				continue
 			}
@@ -702,6 +705,9 @@ func TestUsageReporterTrackFailureStoresErrorContent(t *testing.T) {
 	for {
 		select {
 		case record := <-usagePlugin.records:
+			if record.AuthID != auth.ID {
+				continue
+			}
 			if record.Model != "gpt-image-2" {
 				continue
 			}
@@ -756,6 +762,9 @@ func TestUsageReporterTrackFailureStoresOfficialUpstreamBody(t *testing.T) {
 	for {
 		select {
 		case record := <-usagePlugin.records:
+			if record.AuthID != auth.ID {
+				continue
+			}
 			if record.Model != "gpt-image-2" {
 				continue
 			}
