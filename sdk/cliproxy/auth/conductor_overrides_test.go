@@ -159,3 +159,91 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 		t.Fatalf("expected NextRetryAfter to be zero when disable_cooling=true, got %v", state.NextRetryAfter)
 	}
 }
+
+func TestManager_MarkResult_CoolsKimiMembershipErrors(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "kimi-auth-1", Provider: "kimi"}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "kimi-for-coding"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "kimi",
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: 400,
+			Message:    `{"error":{"message":"We're unable to verify your membership benefits at this time. Please ensure your membership is active.","type":"invalid_request_error"}}`,
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected Kimi membership error to set NextRetryAfter")
+	}
+	if wait := time.Until(state.NextRetryAfter); wait < 25*time.Minute || wait > 31*time.Minute {
+		t.Fatalf("NextRetryAfter wait = %v, want about 30m", wait)
+	}
+	blocked, reason, _ := isAuthBlockedForModel(updated, model, time.Now())
+	if !blocked {
+		t.Fatalf("expected auth to be blocked for model")
+	}
+	if reason != blockReasonOther {
+		t.Fatalf("block reason = %v, want temporary block", reason)
+	}
+}
+
+func TestManager_MarkResult_CoolsKimiUsageLimitAsQuota(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "kimi-auth-2", Provider: "kimi"}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "kimi-k2.6"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "kimi",
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: 400,
+			Message:    `{"error":{"message":"You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle.","type":"access_terminated_error"}}`,
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if !state.Quota.Exceeded {
+		t.Fatalf("expected quota state to be marked exceeded")
+	}
+	if state.Quota.Reason != "quota" {
+		t.Fatalf("quota reason = %q, want quota", state.Quota.Reason)
+	}
+	if wait := time.Until(state.NextRetryAfter); wait < 11*time.Hour || wait > 13*time.Hour {
+		t.Fatalf("NextRetryAfter wait = %v, want about 12h", wait)
+	}
+}

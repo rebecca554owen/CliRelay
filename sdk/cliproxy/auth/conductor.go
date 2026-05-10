@@ -1542,53 +1542,68 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				}
 
 				statusCode := statusCodeFromResult(result.Error)
-				switch statusCode {
-				case 401:
-					next := now.Add(30 * time.Minute)
+				if cooldown, reason, quota := providerAccountCooldown(result.Provider, result.Error, auth); cooldown > 0 {
+					next := now.Add(cooldown)
 					state.NextRetryAfter = next
-					suspendReason = "unauthorized"
+					suspendReason = reason
 					shouldSuspendModel = true
-				case 402, 403:
-					next := now.Add(30 * time.Minute)
-					state.NextRetryAfter = next
-					suspendReason = "payment_required"
-					shouldSuspendModel = true
-				case 404:
-					next := now.Add(12 * time.Hour)
-					state.NextRetryAfter = next
-					suspendReason = "not_found"
-					shouldSuspendModel = true
-				case 429:
-					var next time.Time
-					backoffLevel := state.Quota.BackoffLevel
-					if result.RetryAfter != nil {
-						next = now.Add(*result.RetryAfter)
-					} else {
-						cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
-						if cooldown > 0 {
-							next = now.Add(cooldown)
+					if quota {
+						state.Quota = QuotaState{
+							Exceeded:      true,
+							Reason:        "quota",
+							NextRecoverAt: next,
 						}
-						backoffLevel = nextLevel
+						setModelQuota = true
 					}
-					state.NextRetryAfter = next
-					state.Quota = QuotaState{
-						Exceeded:      true,
-						Reason:        "quota",
-						NextRecoverAt: next,
-						BackoffLevel:  backoffLevel,
-					}
-					suspendReason = "quota"
-					shouldSuspendModel = true
-					setModelQuota = true
-				case 408, 500, 502, 503, 504:
-					if quotaCooldownDisabledForAuth(auth) {
-						state.NextRetryAfter = time.Time{}
-					} else {
-						next := now.Add(1 * time.Minute)
+				} else {
+					switch statusCode {
+					case 401:
+						next := now.Add(30 * time.Minute)
 						state.NextRetryAfter = next
+						suspendReason = "unauthorized"
+						shouldSuspendModel = true
+					case 402, 403:
+						next := now.Add(30 * time.Minute)
+						state.NextRetryAfter = next
+						suspendReason = "payment_required"
+						shouldSuspendModel = true
+					case 404:
+						next := now.Add(12 * time.Hour)
+						state.NextRetryAfter = next
+						suspendReason = "not_found"
+						shouldSuspendModel = true
+					case 429:
+						var next time.Time
+						backoffLevel := state.Quota.BackoffLevel
+						if result.RetryAfter != nil {
+							next = now.Add(*result.RetryAfter)
+						} else {
+							cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
+							if cooldown > 0 {
+								next = now.Add(cooldown)
+							}
+							backoffLevel = nextLevel
+						}
+						state.NextRetryAfter = next
+						state.Quota = QuotaState{
+							Exceeded:      true,
+							Reason:        "quota",
+							NextRecoverAt: next,
+							BackoffLevel:  backoffLevel,
+						}
+						suspendReason = "quota"
+						shouldSuspendModel = true
+						setModelQuota = true
+					case 408, 500, 502, 503, 504:
+						if quotaCooldownDisabledForAuth(auth) {
+							state.NextRetryAfter = time.Time{}
+						} else {
+							next := now.Add(1 * time.Minute)
+							state.NextRetryAfter = next
+						}
+					default:
+						state.NextRetryAfter = time.Time{}
 					}
-				default:
-					state.NextRetryAfter = time.Time{}
 				}
 
 				auth.Status = StatusError
@@ -1898,6 +1913,17 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 	}
 	statusCode := statusCodeFromResult(resultErr)
+	if cooldown, reason, quota := providerAccountCooldown(auth.Provider, resultErr, auth); cooldown > 0 {
+		next := now.Add(cooldown)
+		auth.NextRetryAfter = next
+		auth.StatusMessage = reason
+		if quota {
+			auth.Quota.Exceeded = true
+			auth.Quota.Reason = "quota"
+			auth.Quota.NextRecoverAt = next
+		}
+		return
+	}
 	switch statusCode {
 	case 401:
 		auth.StatusMessage = "unauthorized"
@@ -1935,6 +1961,27 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if auth.StatusMessage == "" {
 			auth.StatusMessage = "request failed"
 		}
+	}
+}
+
+func providerAccountCooldown(provider string, resultErr *Error, auth *Auth) (time.Duration, string, bool) {
+	if resultErr == nil || quotaCooldownDisabledForAuth(auth) {
+		return 0, "", false
+	}
+	if !strings.EqualFold(strings.TrimSpace(provider), "kimi") {
+		return 0, "", false
+	}
+	message := strings.ToLower(resultErr.Message)
+	switch {
+	case strings.Contains(message, "access_terminated_error"),
+		strings.Contains(message, "usage limit for this billing cycle"),
+		strings.Contains(message, "quota will be refreshed"):
+		return 12 * time.Hour, "quota", true
+	case strings.Contains(message, "membership benefits"),
+		strings.Contains(message, "membership is active"):
+		return 30 * time.Minute, "unauthorized", false
+	default:
+		return 0, "", false
 	}
 }
 
