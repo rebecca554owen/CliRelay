@@ -247,3 +247,41 @@ func TestManager_MarkResult_CoolsKimiUsageLimitAsQuota(t *testing.T) {
 		t.Fatalf("NextRetryAfter wait = %v, want about 12h", wait)
 	}
 }
+
+func TestManager_MarkResult_CoolsNoStatusExecutionErrors(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "kimi-auth-3", Provider: "kimi"}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "kimi-for-coding"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "kimi",
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			Message: `Post "https://api.kimi.com/coding/v1/chat/completions": http2: timeout awaiting response headers`,
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected no-status upstream error to set NextRetryAfter")
+	}
+	if wait := time.Until(state.NextRetryAfter); wait < 45*time.Second || wait > 75*time.Second {
+		t.Fatalf("NextRetryAfter wait = %v, want about 1m", wait)
+	}
+}

@@ -1594,7 +1594,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						suspendReason = "quota"
 						shouldSuspendModel = true
 						setModelQuota = true
-					case 408, 500, 502, 503, 504:
+					case 0, 408, 500, 502, 503, 504:
 						if quotaCooldownDisabledForAuth(auth) {
 							state.NextRetryAfter = time.Time{}
 						} else {
@@ -1950,7 +1950,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
-	case 408, 500, 502, 503, 504:
+	case 0, 408, 500, 502, 503, 504:
 		auth.StatusMessage = "transient upstream error"
 		if quotaCooldownDisabledForAuth(auth) {
 			auth.NextRetryAfter = time.Time{}
@@ -1978,7 +1978,10 @@ func providerAccountCooldown(provider string, resultErr *Error, auth *Auth) (tim
 		strings.Contains(message, "quota will be refreshed"):
 		return 12 * time.Hour, "quota", true
 	case strings.Contains(message, "membership benefits"),
-		strings.Contains(message, "membership is active"):
+		strings.Contains(message, "membership is active"),
+		strings.Contains(message, "invalid_authentication_error"),
+		strings.Contains(message, "api key appears to be invalid"),
+		strings.Contains(message, "verify your credentials"):
 		return 30 * time.Minute, "unauthorized", false
 	default:
 		return 0, "", false
