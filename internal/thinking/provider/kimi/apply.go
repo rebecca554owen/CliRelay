@@ -1,7 +1,7 @@
 // Package kimi implements thinking configuration for Kimi (Moonshot AI) models.
 //
-// Kimi models use the OpenAI-compatible reasoning_effort format with discrete
-// levels (minimal/low/medium/high).
+// Kimi models use reasoning_effort as the internal intermediate format. The
+// executor may later rewrite it for endpoint-specific upstream compatibility.
 package kimi
 
 import (
@@ -18,7 +18,7 @@ import (
 //
 // Kimi-specific behavior:
 //   - Output format: reasoning_effort (string: minimal/low/medium/high)
-//   - Uses OpenAI-compatible format
+//   - Executor may rewrite it for endpoint-specific upstream formats
 //   - Supports budget-to-level conversion
 type Applier struct{}
 
@@ -37,9 +37,7 @@ func init() {
 //
 // Expected output format:
 //
-//	{
-//	  "reasoning_effort": "high"
-//	}
+//	{"reasoning_effort": "high"}
 func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *registry.ModelInfo) ([]byte, error) {
 	if thinking.IsUserDefinedModel(modelInfo) {
 		return applyCompatibleKimi(body, config)

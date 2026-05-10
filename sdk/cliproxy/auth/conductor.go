@@ -1507,9 +1507,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
-	accountCooldownUntil := time.Time{}
-	accountCooldownReason := ""
-	accountCooldownQuota := false
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -1548,9 +1545,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				if cooldown, reason, quota := providerAccountCooldown(result.Provider, result.Error, auth); cooldown > 0 {
 					next := now.Add(cooldown)
 					state.NextRetryAfter = next
-					accountCooldownUntil = next
-					accountCooldownReason = reason
-					accountCooldownQuota = quota
 					suspendReason = reason
 					shouldSuspendModel = true
 					if quota {
@@ -1606,10 +1600,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						} else {
 							next := now.Add(1 * time.Minute)
 							state.NextRetryAfter = next
-							if providerTransientAccountCooldown(result.Provider, statusCode) {
-								accountCooldownUntil = next
-								accountCooldownReason = "transient upstream error"
-								accountCooldownQuota = false
+							if providerTransientModelCooldown(result.Provider, statusCode) {
+								suspendReason = "transient upstream error"
+								shouldSuspendModel = true
 							}
 						}
 					default:
@@ -1620,9 +1613,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				auth.Status = StatusError
 				auth.UpdatedAt = now
 				updateAggregatedAvailability(auth, now)
-				if accountCooldownUntil.After(now) {
-					applyAccountCooldown(auth, accountCooldownUntil, accountCooldownReason, accountCooldownQuota)
-				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 			}
@@ -1701,6 +1691,7 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	quotaExceeded := false
 	quotaRecover := time.Time{}
 	maxBackoffLevel := 0
+	kimiScopedCooldownOnly := strings.EqualFold(strings.TrimSpace(auth.Provider), "kimi")
 	for _, state := range auth.ModelStates {
 		if state == nil {
 			continue
@@ -1725,7 +1716,9 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 			allUnavailable = false
 		}
 		if state.Quota.Exceeded {
-			quotaExceeded = true
+			if !kimiScopedCooldownOnly {
+				quotaExceeded = true
+			}
 			if quotaRecover.IsZero() || (!state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.Before(quotaRecover)) {
 				quotaRecover = state.Quota.NextRecoverAt
 			}
@@ -1733,6 +1726,15 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 				maxBackoffLevel = state.Quota.BackoffLevel
 			}
 		}
+	}
+	if kimiScopedCooldownOnly {
+		auth.Unavailable = false
+		auth.NextRetryAfter = time.Time{}
+		auth.Quota.Exceeded = false
+		auth.Quota.Reason = ""
+		auth.Quota.NextRecoverAt = time.Time{}
+		auth.Quota.BackoffLevel = 0
+		return
 	}
 	auth.Unavailable = allUnavailable
 	if allUnavailable {
@@ -1948,13 +1950,14 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 	statusCode := statusCodeFromResult(resultErr)
 	if cooldown, reason, quota := providerAccountCooldown(auth.Provider, resultErr, auth); cooldown > 0 {
-		next := now.Add(cooldown)
-		auth.NextRetryAfter = next
 		auth.StatusMessage = reason
+		auth.NextRetryAfter = time.Time{}
+		auth.Unavailable = false
+		auth.Quota.Exceeded = false
+		auth.Quota.Reason = ""
+		auth.Quota.NextRecoverAt = time.Time{}
 		if quota {
-			auth.Quota.Exceeded = true
-			auth.Quota.Reason = "quota"
-			auth.Quota.NextRecoverAt = next
+			auth.Quota.BackoffLevel = 0
 		}
 		return
 	}
@@ -2055,8 +2058,52 @@ func accountCooldownForMessage(message string) (time.Duration, string, bool) {
 }
 
 func isAccountAvailabilityMessage(message string) bool {
+	if isKimiAccountAvailabilityMessage(message) {
+		return true
+	}
 	cooldown, _, _ := accountCooldownForMessage(message)
 	return cooldown > 0
+}
+
+func isKimiAccountAvailabilityMessage(message string) bool {
+	if !strings.Contains(strings.ToLower(message), "kimi") &&
+		!strings.Contains(strings.ToLower(message), "membership benefits") &&
+		!strings.Contains(strings.ToLower(message), "access_terminated_error") &&
+		!strings.Contains(strings.ToLower(message), "quota will be refreshed") {
+		// Fast-path: only treat the explicitly Kimi-specific signatures here.
+	}
+	cooldown, _, _ := kimiAccountCooldownForMessage(message)
+	return cooldown > 0
+}
+
+func kimiAccountCooldownForMessage(message string) (time.Duration, string, bool) {
+	message = strings.ToLower(message)
+	switch {
+	case strings.Contains(message, "access_terminated_error"),
+		strings.Contains(message, "usage limit for this billing cycle"),
+		strings.Contains(message, "quota will be refreshed"):
+		return 12 * time.Hour, "quota", true
+	case strings.Contains(message, "membership benefits"),
+		strings.Contains(message, "membership is active"),
+		strings.Contains(message, "invalid_authentication_error"),
+		strings.Contains(message, "api key appears to be invalid"),
+		strings.Contains(message, "verify your credentials"):
+		return 30 * time.Minute, "unauthorized", false
+	default:
+		return 0, "", false
+	}
+}
+
+func providerTransientModelCooldown(provider string, statusCode int) bool {
+	if !strings.EqualFold(strings.TrimSpace(provider), "kimi") {
+		return false
+	}
+	switch statusCode {
+	case 0, 408, 500, 502, 503, 504:
+		return true
+	default:
+		return false
+	}
 }
 
 func isRequestScopeFailureMessage(message string) bool {

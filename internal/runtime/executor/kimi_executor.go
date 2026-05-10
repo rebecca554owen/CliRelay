@@ -67,6 +67,10 @@ func (e *KimiExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	from := opts.SourceFormat
 	if from.String() == "claude" {
+		req, opts, err = repairKimiClaudeToolUseRequest(req, opts)
+		if err != nil {
+			return resp, err
+		}
 		auth.Attributes["base_url"] = kimiauth.KimiAPIBaseURL
 		return e.ClaudeExecutor.Execute(ctx, auth, req, opts)
 	}
@@ -94,6 +98,10 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), "kimi", e.Identifier())
+	if err != nil {
+		return resp, err
+	}
+	body, err = normalizeKimiThinkingForEndpoint(body, urlForKimiChatCompletions())
 	if err != nil {
 		return resp, err
 	}
@@ -169,6 +177,10 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	from := opts.SourceFormat
 	if from.String() == "claude" {
+		req, opts, err = repairKimiClaudeToolUseRequest(req, opts)
+		if err != nil {
+			return nil, err
+		}
 		auth.Attributes["base_url"] = kimiauth.KimiAPIBaseURL
 		return e.ClaudeExecutor.ExecuteStream(ctx, auth, req, opts)
 	}
@@ -195,6 +207,10 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), "kimi", e.Identifier())
+	if err != nil {
+		return nil, err
+	}
+	body, err = normalizeKimiThinkingForEndpoint(body, urlForKimiChatCompletions())
 	if err != nil {
 		return nil, err
 	}
@@ -292,8 +308,353 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 // CountTokens estimates token count for Kimi requests.
 func (e *KimiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	var err error
+	if opts.SourceFormat.String() == "claude" {
+		req, opts, err = repairKimiClaudeToolUseRequest(req, opts)
+		if err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
+	}
 	auth.Attributes["base_url"] = kimiauth.KimiAPIBaseURL
 	return e.ClaudeExecutor.CountTokens(ctx, auth, req, opts)
+}
+
+func repairKimiClaudeToolUseRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
+	repaired, err := repairClaudeToolUseHistory(req.Payload, "kimi")
+	if err != nil {
+		return req, opts, err
+	}
+	req.Payload = repaired
+
+	if len(opts.OriginalRequest) > 0 {
+		original, _, errOriginal := dropUnansweredClaudeToolUses(opts.OriginalRequest)
+		if errOriginal != nil {
+			return req, opts, errOriginal
+		}
+		opts.OriginalRequest = original
+	}
+
+	return req, opts, nil
+}
+
+func repairClaudeToolUseHistory(body []byte, executorName string) ([]byte, error) {
+	repaired, merged, err := coalesceAdjacentClaudeToolResultMessages(body)
+	if err != nil {
+		return body, err
+	}
+	repaired, removedToolUses, err := dropUnansweredClaudeToolUses(repaired)
+	if err != nil {
+		return body, err
+	}
+	repaired, removedToolResults, err := dropOrphanClaudeToolResults(repaired)
+	if err != nil {
+		return body, err
+	}
+	if merged > 0 || removedToolUses > 0 || removedToolResults > 0 {
+		log.WithFields(log.Fields{
+			"executor":             executorName,
+			"merged_tool_results":  merged,
+			"removed_tool_uses":    removedToolUses,
+			"removed_tool_results": removedToolResults,
+		}).Warn("dropped unanswered Claude tool_use history")
+	}
+	return repaired, nil
+}
+
+func coalesceAdjacentClaudeToolResultMessages(body []byte) ([]byte, int, error) {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body, 0, nil
+	}
+
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body, 0, nil
+	}
+
+	msgs := messages.Array()
+	outMessages := []byte(`[]`)
+	changed := false
+	merged := 0
+
+	for msgIdx := 0; msgIdx < len(msgs); msgIdx++ {
+		msg := msgs[msgIdx]
+		if strings.TrimSpace(msg.Get("role").String()) != "assistant" || !claudeMessageHasToolUse(msg) || msgIdx+1 >= len(msgs) {
+			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			continue
+		}
+
+		firstResults, ok := claudeToolResultOnlyContent(msgs[msgIdx+1])
+		if !ok {
+			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			continue
+		}
+
+		mergedContent := []byte(`[]`)
+		for _, part := range firstResults {
+			mergedContent, _ = sjson.SetRawBytes(mergedContent, "-1", []byte(part.Raw))
+		}
+
+		lastResultIdx := msgIdx + 1
+		for nextIdx := msgIdx + 2; nextIdx < len(msgs); nextIdx++ {
+			nextResults, nextOK := claudeToolResultOnlyContent(msgs[nextIdx])
+			if !nextOK {
+				break
+			}
+			for _, part := range nextResults {
+				mergedContent, _ = sjson.SetRawBytes(mergedContent, "-1", []byte(part.Raw))
+			}
+			lastResultIdx = nextIdx
+			merged++
+			changed = true
+		}
+
+		outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+		firstMsg, err := sjson.SetRawBytes([]byte(msgs[msgIdx+1].Raw), "content", mergedContent)
+		if err != nil {
+			return body, 0, fmt.Errorf("failed to merge Claude tool_result messages: %w", err)
+		}
+		outMessages, _ = sjson.SetRawBytes(outMessages, "-1", firstMsg)
+		msgIdx = lastResultIdx
+	}
+
+	if !changed {
+		return body, 0, nil
+	}
+
+	out, err := sjson.SetRawBytes(body, "messages", outMessages)
+	if err != nil {
+		return body, 0, fmt.Errorf("failed to update Claude messages: %w", err)
+	}
+	return out, merged, nil
+}
+
+func claudeMessageHasToolUse(msg gjson.Result) bool {
+	content := msg.Get("content")
+	if !content.IsArray() {
+		return false
+	}
+	for _, part := range content.Array() {
+		if part.Get("type").String() == "tool_use" {
+			return true
+		}
+	}
+	return false
+}
+
+func claudeToolResultOnlyContent(msg gjson.Result) ([]gjson.Result, bool) {
+	if strings.TrimSpace(msg.Get("role").String()) != "user" {
+		return nil, false
+	}
+	content := msg.Get("content")
+	if !content.IsArray() {
+		return nil, false
+	}
+	parts := content.Array()
+	if len(parts) == 0 {
+		return nil, false
+	}
+	for _, part := range parts {
+		if part.Get("type").String() != "tool_result" {
+			return nil, false
+		}
+	}
+	return parts, true
+}
+
+func dropUnansweredClaudeToolUses(body []byte) ([]byte, int, error) {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body, 0, nil
+	}
+
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body, 0, nil
+	}
+
+	msgs := messages.Array()
+	outMessages := []byte(`[]`)
+	changed := false
+	removed := 0
+
+	for msgIdx, msg := range msgs {
+		role := strings.TrimSpace(msg.Get("role").String())
+		content := msg.Get("content")
+		if role != "assistant" || !content.IsArray() {
+			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			continue
+		}
+
+		nextToolResults := claudeToolResultIDsInNextUserMessage(msgs, msgIdx)
+		contentOut := []byte(`[]`)
+		contentChanged := false
+		keptParts := 0
+
+		for _, part := range content.Array() {
+			if part.Get("type").String() == "tool_use" {
+				toolUseID := strings.TrimSpace(part.Get("id").String())
+				if toolUseID == "" || !nextToolResults[toolUseID] {
+					contentChanged = true
+					removed++
+					continue
+				}
+			}
+
+			contentOut, _ = sjson.SetRawBytes(contentOut, "-1", []byte(part.Raw))
+			keptParts++
+		}
+
+		if !contentChanged {
+			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			continue
+		}
+
+		changed = true
+		if keptParts == 0 {
+			continue
+		}
+
+		msgOut, err := sjson.SetRawBytes([]byte(msg.Raw), "content", contentOut)
+		if err != nil {
+			return body, 0, fmt.Errorf("failed to drop unanswered Claude tool_use: %w", err)
+		}
+		outMessages, _ = sjson.SetRawBytes(outMessages, "-1", msgOut)
+	}
+
+	if !changed {
+		return body, 0, nil
+	}
+
+	out, err := sjson.SetRawBytes(body, "messages", outMessages)
+	if err != nil {
+		return body, 0, fmt.Errorf("failed to update Claude messages: %w", err)
+	}
+	return out, removed, nil
+}
+
+func dropOrphanClaudeToolResults(body []byte) ([]byte, int, error) {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body, 0, nil
+	}
+
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body, 0, nil
+	}
+
+	msgs := messages.Array()
+	outMessages := []byte(`[]`)
+	pending := map[string]bool{}
+	changed := false
+	removed := 0
+
+	for _, msg := range msgs {
+		role := strings.TrimSpace(msg.Get("role").String())
+		switch role {
+		case "assistant":
+			pending = claudeToolUseIDsInMessage(msg)
+			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+		case "user":
+			content := msg.Get("content")
+			if !content.IsArray() {
+				pending = map[string]bool{}
+				outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+				continue
+			}
+
+			contentOut := []byte(`[]`)
+			contentChanged := false
+			keptParts := 0
+			for _, part := range content.Array() {
+				if part.Get("type").String() == "tool_result" {
+					toolUseID := strings.TrimSpace(part.Get("tool_use_id").String())
+					if toolUseID == "" || !pending[toolUseID] {
+						contentChanged = true
+						changed = true
+						removed++
+						continue
+					}
+					delete(pending, toolUseID)
+				}
+				contentOut, _ = sjson.SetRawBytes(contentOut, "-1", []byte(part.Raw))
+				keptParts++
+			}
+			if !contentChanged {
+				outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+				pending = map[string]bool{}
+				continue
+			}
+			if keptParts == 0 {
+				pending = map[string]bool{}
+				continue
+			}
+			msgOut, err := sjson.SetRawBytes([]byte(msg.Raw), "content", contentOut)
+			if err != nil {
+				return body, 0, fmt.Errorf("failed to drop orphan Claude tool_result: %w", err)
+			}
+			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", msgOut)
+			pending = map[string]bool{}
+		default:
+			pending = map[string]bool{}
+			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+		}
+	}
+
+	if !changed {
+		return body, 0, nil
+	}
+
+	out, err := sjson.SetRawBytes(body, "messages", outMessages)
+	if err != nil {
+		return body, 0, fmt.Errorf("failed to update Claude messages: %w", err)
+	}
+	return out, removed, nil
+}
+
+func claudeToolUseIDsInMessage(msg gjson.Result) map[string]bool {
+	ids := make(map[string]bool)
+	content := msg.Get("content")
+	if !content.IsArray() {
+		return ids
+	}
+	for _, part := range content.Array() {
+		if part.Get("type").String() != "tool_use" {
+			continue
+		}
+		toolUseID := strings.TrimSpace(part.Get("id").String())
+		if toolUseID != "" {
+			ids[toolUseID] = true
+		}
+	}
+	return ids
+}
+
+func claudeToolResultIDsInNextUserMessage(messages []gjson.Result, assistantIdx int) map[string]bool {
+	result := make(map[string]bool)
+	nextIdx := assistantIdx + 1
+	if nextIdx >= len(messages) {
+		return result
+	}
+
+	next := messages[nextIdx]
+	if strings.TrimSpace(next.Get("role").String()) != "user" {
+		return result
+	}
+
+	content := next.Get("content")
+	if !content.IsArray() {
+		return result
+	}
+
+	for _, part := range content.Array() {
+		if part.Get("type").String() != "tool_result" {
+			continue
+		}
+		toolUseID := strings.TrimSpace(part.Get("tool_use_id").String())
+		if toolUseID != "" {
+			result[toolUseID] = true
+		}
+	}
+	return result
 }
 
 func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
@@ -306,7 +667,17 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 		return body, nil
 	}
 
-	out := body
+	msgs := messages.Array()
+	out, dropped, err := filterKimiEmptyAssistantMessages(body, msgs)
+	if err != nil {
+		return body, err
+	}
+	if dropped > 0 {
+		log.WithField("dropped_assistant_messages", dropped).Debug("kimi executor: dropped empty assistant messages")
+	}
+
+	messages = gjson.GetBytes(out, "messages")
+	msgs = messages.Array()
 	pending := make([]string, 0)
 	patched := 0
 	patchedReasoning := 0
@@ -323,8 +694,6 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 			return
 		}
 	}
-
-	msgs := messages.Array()
 	for msgIdx := range msgs {
 		msg := msgs[msgIdx]
 		role := strings.TrimSpace(msg.Get("role").String())
@@ -410,6 +779,96 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 	}
 
 	return out, nil
+}
+
+func filterKimiEmptyAssistantMessages(body []byte, msgs []gjson.Result) ([]byte, int, error) {
+	kept := make([]string, 0, len(msgs))
+	dropped := 0
+	for _, msg := range msgs {
+		if shouldDropKimiAssistantMessage(msg) {
+			dropped++
+			continue
+		}
+		kept = append(kept, msg.Raw)
+	}
+	if dropped == 0 {
+		return body, 0, nil
+	}
+
+	rawMessages := []byte("[" + strings.Join(kept, ",") + "]")
+	out, err := sjson.SetRawBytes(body, "messages", rawMessages)
+	if err != nil {
+		return body, 0, fmt.Errorf("kimi executor: failed to drop empty assistant messages: %w", err)
+	}
+	return out, dropped, nil
+}
+
+func shouldDropKimiAssistantMessage(msg gjson.Result) bool {
+	if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
+		return false
+	}
+	if hasKimiToolCalls(msg) || hasKimiLegacyFunctionCall(msg) || hasKimiAssistantReasoning(msg) {
+		return false
+	}
+	return isKimiAssistantContentEmpty(msg.Get("content"))
+}
+
+func hasKimiToolCalls(msg gjson.Result) bool {
+	toolCalls := msg.Get("tool_calls")
+	return toolCalls.Exists() && toolCalls.IsArray() && len(toolCalls.Array()) > 0
+}
+
+func hasKimiLegacyFunctionCall(msg gjson.Result) bool {
+	functionCall := msg.Get("function_call")
+	if !functionCall.Exists() || functionCall.Type == gjson.Null {
+		return false
+	}
+	if functionCall.IsObject() && strings.TrimSpace(functionCall.Raw) == "{}" {
+		return false
+	}
+	return strings.TrimSpace(functionCall.Raw) != ""
+}
+
+func hasKimiAssistantReasoning(msg gjson.Result) bool {
+	reasoning := msg.Get("reasoning_content")
+	return reasoning.Exists() && strings.TrimSpace(reasoning.String()) != ""
+}
+
+func isKimiAssistantContentEmpty(content gjson.Result) bool {
+	if !content.Exists() || content.Type == gjson.Null {
+		return true
+	}
+	if content.Type == gjson.String {
+		return strings.TrimSpace(content.String()) == ""
+	}
+	if !content.IsArray() {
+		return false
+	}
+	for _, part := range content.Array() {
+		if !isKimiAssistantContentPartEmpty(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func isKimiAssistantContentPartEmpty(part gjson.Result) bool {
+	if !part.Exists() || part.Type == gjson.Null {
+		return true
+	}
+	if part.Type == gjson.String {
+		return strings.TrimSpace(part.String()) == ""
+	}
+	if !part.IsObject() {
+		return false
+	}
+	if text := part.Get("text"); text.Exists() {
+		return strings.TrimSpace(text.String()) == ""
+	}
+	if strings.TrimSpace(part.Get("type").String()) == "text" {
+		return true
+	}
+	return strings.TrimSpace(part.Raw) == "{}"
 }
 
 func fallbackAssistantReasoning(msg gjson.Result, hasLatest bool, latest string) string {
@@ -627,20 +1086,68 @@ func kimiCreds(a *cliproxyauth.Auth) (token string) {
 	return ""
 }
 
-// resolveKimiUpstreamModel translates local Kimi model aliases to the model name
-// accepted by the Kimi Code API while preserving user-defined model ids.
-func resolveKimiUpstreamModel(model string) string {
-	model = strings.TrimSpace(model)
-	switch strings.ToLower(model) {
-	case "kimi-k2",
-		"kimi-k2-thinking",
-		"kimi-k2-thinking-turbo",
-		"kimi-k2.5",
-		"kimi-k2.6",
-		"kimi-k2-0711-preview",
-		"kimi-k2-0905-preview",
-		"kimi-k2-turbo-preview":
-		return "kimi-for-coding"
+func urlForKimiChatCompletions() string {
+	return kimiauth.KimiAPIBaseURL + "/v1/chat/completions"
+}
+
+func normalizeKimiThinkingForEndpoint(body []byte, targetURL string) ([]byte, error) {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body, nil
 	}
-	return model
+	targetURL = strings.ToLower(strings.TrimSpace(targetURL))
+	if targetURL == "" {
+		return body, nil
+	}
+	if strings.Contains(targetURL, "api.kimi.com/coding") {
+		if updated, err := sjson.DeleteBytes(body, "reasoning_effort"); err == nil {
+			body = updated
+		}
+		return body, nil
+	}
+	if strings.Contains(targetURL, "api.moonshot.cn") || strings.Contains(targetURL, "api.moonshot.ai") {
+		return convertKimiReasoningEffortToThinking(body)
+	}
+	return body, nil
+}
+
+func convertKimiReasoningEffortToThinking(body []byte) ([]byte, error) {
+	effort := gjson.GetBytes(body, "reasoning_effort")
+	if !effort.Exists() {
+		return body, nil
+	}
+
+	result, err := sjson.DeleteBytes(body, "reasoning_effort")
+	if err == nil {
+		body = result
+	}
+
+	value := strings.ToLower(strings.TrimSpace(effort.String()))
+	switch value {
+	case "", "none":
+		result, err = sjson.DeleteBytes(body, "thinking")
+		if err == nil {
+			body = result
+		}
+		result, err = sjson.SetBytes(body, "thinking.type", "disabled")
+		if err != nil {
+			return body, fmt.Errorf("kimi executor: failed to set disabled thinking: %w", err)
+		}
+		return result, nil
+	case "minimal", "low", "medium", "high":
+		result, err = sjson.DeleteBytes(body, "thinking")
+		if err == nil {
+			body = result
+		}
+		result, err = sjson.SetBytes(body, "thinking.type", value)
+		if err != nil {
+			return body, fmt.Errorf("kimi executor: failed to set thinking.type: %w", err)
+		}
+		return result, nil
+	default:
+		return body, nil
+	}
+}
+
+func resolveKimiUpstreamModel(model string) string {
+	return strings.TrimSpace(model)
 }

@@ -160,7 +160,7 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 	}
 }
 
-func TestManager_MarkResult_CoolsKimiMembershipErrors(t *testing.T) {
+func TestManager_MarkResult_CoolsKimiMembershipErrorsOnlyForCurrentModel(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
@@ -197,26 +197,21 @@ func TestManager_MarkResult_CoolsKimiMembershipErrors(t *testing.T) {
 	if wait := time.Until(state.NextRetryAfter); wait < 25*time.Minute || wait > 31*time.Minute {
 		t.Fatalf("NextRetryAfter wait = %v, want about 30m", wait)
 	}
-	blocked, reason, _ := isAuthBlockedForModel(updated, model, time.Now())
-	if !blocked {
-		t.Fatalf("expected auth to be blocked for model")
+	if blocked, reason, _ := isAuthBlockedForModel(updated, model, time.Now()); !blocked || reason != blockReasonOther {
+		t.Fatalf("expected current model to be blocked, blocked=%v reason=%v", blocked, reason)
 	}
-	if reason != blockReasonOther {
-		t.Fatalf("block reason = %v, want temporary block", reason)
+	if blockedOtherModel, _, _ := isAuthBlockedForModel(updated, "kimi-k2.6", time.Now()); blockedOtherModel {
+		t.Fatalf("expected other model aliases to remain available")
 	}
-	blockedOtherModel, reasonOtherModel, _ := isAuthBlockedForModel(updated, "kimi-k2.6", time.Now())
-	if !blockedOtherModel {
-		t.Fatalf("expected Kimi account cooldown to block other model aliases")
+	if !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("expected auth-level NextRetryAfter to stay zero, got %v", updated.NextRetryAfter)
 	}
-	if reasonOtherModel != blockReasonOther {
-		t.Fatalf("other model block reason = %v, want temporary block", reasonOtherModel)
-	}
-	if wait := time.Until(updated.NextRetryAfter); wait < 25*time.Minute || wait > 31*time.Minute {
-		t.Fatalf("auth NextRetryAfter wait = %v, want about 30m", wait)
+	if updated.Unavailable {
+		t.Fatalf("expected auth-level availability to remain false")
 	}
 }
 
-func TestManager_MarkResult_CoolsKimiUsageLimitAsQuota(t *testing.T) {
+func TestManager_MarkResult_CoolsKimiUsageLimitAsModelQuotaOnly(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
@@ -253,12 +248,15 @@ func TestManager_MarkResult_CoolsKimiUsageLimitAsQuota(t *testing.T) {
 	if state.Quota.Reason != "quota" {
 		t.Fatalf("quota reason = %q, want quota", state.Quota.Reason)
 	}
-	if wait := time.Until(state.NextRetryAfter); wait < 11*time.Hour || wait > 13*time.Hour {
-		t.Fatalf("NextRetryAfter wait = %v, want about 12h", wait)
+	if blockedOtherModel, _, _ := isAuthBlockedForModel(updated, "kimi-for-coding", time.Now()); blockedOtherModel {
+		t.Fatalf("expected other aliases to remain available")
+	}
+	if updated.Quota.Exceeded {
+		t.Fatalf("expected auth-level quota flag to remain false")
 	}
 }
 
-func TestManager_MarkResult_CoolsNoStatusExecutionErrors(t *testing.T) {
+func TestManager_MarkResult_CoolsKimiNoStatusErrorsOnlyForCurrentModel(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
@@ -293,5 +291,8 @@ func TestManager_MarkResult_CoolsNoStatusExecutionErrors(t *testing.T) {
 	}
 	if wait := time.Until(state.NextRetryAfter); wait < 45*time.Second || wait > 75*time.Second {
 		t.Fatalf("NextRetryAfter wait = %v, want about 1m", wait)
+	}
+	if blockedOtherModel, _, _ := isAuthBlockedForModel(updated, "kimi-k2.6", time.Now()); blockedOtherModel {
+		t.Fatalf("expected other aliases to remain available")
 	}
 }

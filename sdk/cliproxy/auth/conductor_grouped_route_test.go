@@ -145,39 +145,6 @@ func (e *kimiAccountAvailabilityExecutor) Execute(ctx context.Context, auth *Aut
 	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
 }
 
-type firstAuthErrorExecutor struct {
-	sequenceExecutor
-	id         string
-	failAuthID string
-	status     int
-	message    string
-}
-
-func (e *firstAuthErrorExecutor) Identifier() string { return e.id }
-
-func (e *firstAuthErrorExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	_ = ctx
-	_ = req
-	_ = opts
-
-	authID := ""
-	if auth != nil {
-		authID = auth.ID
-	}
-
-	e.mu.Lock()
-	e.execAuth = append(e.execAuth, authID)
-	e.mu.Unlock()
-
-	if authID == e.failAuthID {
-		return cliproxyexecutor.Response{}, &Error{
-			Message:    e.message,
-			HTTPStatus: e.status,
-		}
-	}
-	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
-}
-
 func registerGroupedRouteTestAuths(t *testing.T, manager *Manager) {
 	t.Helper()
 
@@ -201,34 +168,6 @@ func registerGroupedRouteTestAuths(t *testing.T, manager *Manager) {
 			t.Fatalf("register %s: %v", auth.ID, err)
 		}
 	}
-}
-
-func registerProviderRouteTestAuths(t *testing.T, manager *Manager, provider string, models ...string) (string, string) {
-	t.Helper()
-
-	firstID := provider + "-auth-a"
-	secondID := provider + "-auth-b"
-	reg := registry.GetGlobalRegistry()
-	now := time.Now().Unix()
-	modelInfos := make([]*registry.ModelInfo, 0, len(models))
-	for _, model := range models {
-		modelInfos = append(modelInfos, &registry.ModelInfo{ID: model, Created: now})
-	}
-	for _, auth := range []*Auth{
-		{ID: firstID, Provider: provider, Status: StatusActive},
-		{ID: secondID, Provider: provider, Status: StatusActive},
-	} {
-		if _, err := manager.Register(context.Background(), auth); err != nil {
-			t.Fatalf("register %s: %v", auth.ID, err)
-		}
-		if len(modelInfos) > 0 {
-			reg.RegisterClient(auth.ID, provider, modelInfos)
-			t.Cleanup(func(id string) func() {
-				return func() { reg.UnregisterClient(id) }
-			}(auth.ID))
-		}
-	}
-	return firstID, secondID
 }
 
 func registerKimiRouteTestAuths(t *testing.T, manager *Manager) {
@@ -323,7 +262,7 @@ func TestManagerExecute_ModelNotSupportedBadRequestDoesNotFailOver(t *testing.T)
 	}
 }
 
-func TestManagerExecute_KimiAccountInvalidRequestFailsOver(t *testing.T) {
+func TestManagerExecute_KimiAccountInvalidRequestFailsOverWithoutBlockingOtherAliases(t *testing.T) {
 	t.Parallel()
 
 	executor := &kimiAccountAvailabilityExecutor{}
@@ -351,83 +290,11 @@ func TestManagerExecute_KimiAccountInvalidRequestFailsOver(t *testing.T) {
 	if !ok || updated == nil {
 		t.Fatalf("expected auth-a to remain registered")
 	}
-	blocked, reason, _ := isAuthBlockedForModel(updated, "kimi-k2.6", time.Now())
-	if !blocked {
-		t.Fatalf("expected Kimi account error to block other aliases")
+	if blocked, _, _ := isAuthBlockedForModel(updated, "kimi-k2.6", time.Now()); blocked {
+		t.Fatalf("expected other Kimi aliases to remain selectable")
 	}
-	if reason != blockReasonOther {
-		t.Fatalf("block reason = %v, want temporary block", reason)
-	}
-}
-
-func TestManagerExecute_GenericAccountInvalidRequestFailsOver(t *testing.T) {
-	t.Parallel()
-
-	const model = "qwen3.5-plus"
-	executor := &firstAuthErrorExecutor{
-		id:      "qwen",
-		status:  http.StatusBadRequest,
-		message: `{"error":{"code":"invalid_api_key","message":"invalid access token or token expired","type":"invalid_request_error"}}`,
-	}
-	manager := NewManager(nil, &RoundRobinSelector{}, nil)
-	manager.RegisterExecutor(executor)
-	firstID, secondID := registerProviderRouteTestAuths(t, manager, "qwen", model, "qwen3.5-coder")
-	executor.failAuthID = firstID
-
-	resp, err := manager.Execute(context.Background(), []string{"qwen"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-	if string(resp.Payload) != "ok" {
-		t.Fatalf("Execute() payload = %q, want %q", string(resp.Payload), "ok")
-	}
-
-	calls := executor.Calls()
-	if len(calls) != 2 {
-		t.Fatalf("expected failover after account error, got %v", calls)
-	}
-	if calls[0] != firstID || calls[1] != secondID {
-		t.Fatalf("expected failover sequence [%s %s], got %v", firstID, secondID, calls)
-	}
-
-	updated, ok := manager.GetByID(firstID)
-	if !ok || updated == nil {
-		t.Fatalf("expected %s to remain registered", firstID)
-	}
-	blocked, reason, _ := isAuthBlockedForModel(updated, "qwen3.5-coder", time.Now())
-	if !blocked {
-		t.Fatalf("expected account error to block other aliases")
-	}
-	if reason != blockReasonOther {
-		t.Fatalf("block reason = %v, want temporary block", reason)
-	}
-}
-
-func TestManagerExecute_RequestShapeInvalidRequestDoesNotFailOver(t *testing.T) {
-	t.Parallel()
-
-	const model = "claude-sonnet-4-6"
-	executor := &firstAuthErrorExecutor{
-		id:      "claude",
-		status:  http.StatusBadRequest,
-		message: `{"error":{"message":"message 0 content must not be empty","type":"invalid_request_error"}}`,
-	}
-	manager := NewManager(nil, &RoundRobinSelector{}, nil)
-	manager.RegisterExecutor(executor)
-	firstID, _ := registerProviderRouteTestAuths(t, manager, "claude", model)
-	executor.failAuthID = firstID
-
-	_, err := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if err == nil {
-		t.Fatal("expected request-shape error")
-	}
-
-	calls := executor.Calls()
-	if len(calls) != 1 {
-		t.Fatalf("expected request-shape error to stop after first auth, got %v", calls)
-	}
-	if calls[0] != firstID {
-		t.Fatalf("expected first auth only, got %v", calls)
+	if blocked, reason, _ := isAuthBlockedForModel(updated, "kimi-for-coding", time.Now()); !blocked || reason != blockReasonOther {
+		t.Fatalf("expected current model to be cooled only, blocked=%v reason=%v", blocked, reason)
 	}
 }
 

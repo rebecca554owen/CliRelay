@@ -3,35 +3,128 @@ package executor
 import (
 	"testing"
 
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
 
-func TestResolveKimiUpstreamModel_UsesKimiCodeManagedModelForBuiltins(t *testing.T) {
-	for _, model := range []string{
-		"kimi-k2",
-		"kimi-k2-thinking",
-		"kimi-k2-thinking-turbo",
-		"kimi-k2.5",
-		"kimi-k2.6",
-		"kimi-k2-0711-preview",
-		"kimi-k2-0905-preview",
-		"kimi-k2-turbo-preview",
-	} {
-		if got := resolveKimiUpstreamModel(model); got != "kimi-for-coding" {
-			t.Fatalf("resolveKimiUpstreamModel(%q) = %q, want %q", model, got, "kimi-for-coding")
-		}
-	}
-}
-
-func TestResolveKimiUpstreamModel_PreservesKimiForCodingAndCustomModels(t *testing.T) {
+func TestResolveKimiUpstreamModel_PreservesCompleteNames(t *testing.T) {
 	for _, model := range []string{
 		"kimi-for-coding",
-		"moonshot-v1-128k",
+		"kimi-k2.6",
+		"kimi-k2-thinking",
+		"kimi-k2",
 		"custom-kimi-model",
 	} {
 		if got := resolveKimiUpstreamModel(model); got != model {
 			t.Fatalf("resolveKimiUpstreamModel(%q) = %q, want %q", model, got, model)
 		}
+	}
+}
+
+func TestRepairKimiClaudeToolUseRequest_DropsUnansweredToolUses(t *testing.T) {
+	req := cliproxyexecutor.Request{Payload: []byte(`{
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"call_1","name":"read_file","input":{}},
+				{"type":"tool_use","id":"call_2","name":"glob","input":{}}
+			]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"ok"}]}
+		]
+	}`)}
+
+	repairedReq, _, err := repairKimiClaudeToolUseRequest(req, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("repairKimiClaudeToolUseRequest() error = %v", err)
+	}
+
+	if got := len(gjson.GetBytes(repairedReq.Payload, "messages.0.content").Array()); got != 1 {
+		t.Fatalf("messages.0.content length = %d, want 1; body=%s", got, repairedReq.Payload)
+	}
+	if gjson.GetBytes(repairedReq.Payload, `messages.0.content.#(id=="call_2")`).Exists() {
+		t.Fatalf("unanswered tool_use should be removed: %s", repairedReq.Payload)
+	}
+}
+
+func TestRepairKimiClaudeToolUseRequest_CoalescesAdjacentToolResults(t *testing.T) {
+	req := cliproxyexecutor.Request{Payload: []byte(`{
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read_file","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"a"}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"b"}]}
+		]
+	}`)}
+
+	repairedReq, _, err := repairKimiClaudeToolUseRequest(req, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("repairKimiClaudeToolUseRequest() error = %v", err)
+	}
+
+	if got := len(gjson.GetBytes(repairedReq.Payload, "messages").Array()); got != 2 {
+		t.Fatalf("messages length = %d, want 2; body=%s", got, repairedReq.Payload)
+	}
+	if got := gjson.GetBytes(repairedReq.Payload, "messages.1.content.0.content").String(); got != "a" {
+		t.Fatalf("kept tool_result content = %q, want %q; body=%s", got, "a", repairedReq.Payload)
+	}
+}
+
+func TestNormalizeKimiToolMessageLinks_DropsEmptyAssistantMessages(t *testing.T) {
+	body := []byte(`{
+		"messages":[
+			{"role":"assistant","content":""},
+			{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{}"}}]},
+			{"role":"tool","call_id":"call_1","content":"[]"}
+		]
+	}`)
+
+	out, err := normalizeKimiToolMessageLinks(body)
+	if err != nil {
+		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
+	}
+
+	if got := len(gjson.GetBytes(out, "messages").Array()); got != 2 {
+		t.Fatalf("messages length = %d, want 2; body=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "assistant" {
+		t.Fatalf("messages.0.role = %q, want assistant; body=%s", got, out)
+	}
+}
+
+func TestNormalizeKimiThinkingForEndpoint_KimiCodingRemovesReasoningEffort(t *testing.T) {
+	body := []byte(`{"model":"kimi-k2.6","reasoning_effort":"high"}`)
+
+	out, err := normalizeKimiThinkingForEndpoint(body, "https://api.kimi.com/coding/v1/chat/completions")
+	if err != nil {
+		t.Fatalf("normalizeKimiThinkingForEndpoint() error = %v", err)
+	}
+	if gjson.GetBytes(out, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be removed: %s", out)
+	}
+}
+
+func TestNormalizeKimiThinkingForEndpoint_MoonshotConvertsToThinkingType(t *testing.T) {
+	body := []byte(`{"model":"kimi-k2.6","reasoning_effort":"high"}`)
+
+	out, err := normalizeKimiThinkingForEndpoint(body, "https://api.moonshot.cn/v1/chat/completions")
+	if err != nil {
+		t.Fatalf("normalizeKimiThinkingForEndpoint() error = %v", err)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "high" {
+		t.Fatalf("thinking.type = %q, want high; body=%s", got, out)
+	}
+	if gjson.GetBytes(out, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be removed after conversion: %s", out)
+	}
+}
+
+func TestNormalizeKimiThinkingForEndpoint_MoonshotConvertsNoneToDisabled(t *testing.T) {
+	body := []byte(`{"model":"kimi-k2.6","reasoning_effort":"none"}`)
+
+	out, err := normalizeKimiThinkingForEndpoint(body, "https://api.moonshot.ai/v1/chat/completions")
+	if err != nil {
+		t.Fatalf("normalizeKimiThinkingForEndpoint() error = %v", err)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled; body=%s", got, out)
 	}
 }
 
