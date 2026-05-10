@@ -1039,6 +1039,30 @@ func GetAntigravityModelConfig() map[string]*AntigravityModelConfig {
 func GetKimiModels() []*ModelInfo {
 	return []*ModelInfo{
 		{
+			ID:                  "kimi-for-coding",
+			Object:              "model",
+			Created:             1773878400, // 2026-03-19
+			OwnedBy:             "moonshot",
+			Type:                "kimi",
+			DisplayName:         "Kimi for Coding",
+			Description:         "Kimi Code managed coding model",
+			ContextLength:       262144,
+			MaxCompletionTokens: 32768,
+			Thinking:            &ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
+		},
+		{
+			ID:                  "kimi-k2.6",
+			Object:              "model",
+			Created:             1773878400, // 2026-03-19
+			OwnedBy:             "moonshot",
+			Type:                "kimi",
+			DisplayName:         "Kimi K2.6",
+			Description:         "Kimi K2.6 - latest Kimi coding model exposed through Kimi Code",
+			ContextLength:       262144,
+			MaxCompletionTokens: 32768,
+			Thinking:            &ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
+		},
+		{
 			ID:                  "kimi-k2",
 			Object:              "model",
 			Created:             1752192000, // 2025-07-11

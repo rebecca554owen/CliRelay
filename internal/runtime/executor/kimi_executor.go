@@ -87,8 +87,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), false)
 
-	// Strip kimi- prefix for upstream API
-	upstreamModel := stripKimiPrefix(baseModel)
+	upstreamModel := resolveKimiUpstreamModel(baseModel)
 	body, err = sjson.SetBytes(body, "model", upstreamModel)
 	if err != nil {
 		return resp, fmt.Errorf("kimi executor: failed to set model in payload: %w", err)
@@ -189,8 +188,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), true)
 
-	// Strip kimi- prefix for upstream API
-	upstreamModel := stripKimiPrefix(baseModel)
+	upstreamModel := resolveKimiUpstreamModel(baseModel)
 	body, err = sjson.SetBytes(body, "model", upstreamModel)
 	if err != nil {
 		return nil, fmt.Errorf("kimi executor: failed to set model in payload: %w", err)
@@ -629,11 +627,20 @@ func kimiCreds(a *cliproxyauth.Auth) (token string) {
 	return ""
 }
 
-// stripKimiPrefix removes the "kimi-" prefix from model names for the upstream API.
-func stripKimiPrefix(model string) string {
+// resolveKimiUpstreamModel translates local Kimi model aliases to the model name
+// accepted by the Kimi Code API while preserving user-defined model ids.
+func resolveKimiUpstreamModel(model string) string {
 	model = strings.TrimSpace(model)
-	if strings.HasPrefix(strings.ToLower(model), "kimi-") {
-		return model[5:]
+	switch strings.ToLower(model) {
+	case "kimi-k2",
+		"kimi-k2-thinking",
+		"kimi-k2-thinking-turbo",
+		"kimi-k2.5",
+		"kimi-k2.6",
+		"kimi-k2-0711-preview",
+		"kimi-k2-0905-preview",
+		"kimi-k2-turbo-preview":
+		return "kimi-for-coding"
 	}
 	return model
 }

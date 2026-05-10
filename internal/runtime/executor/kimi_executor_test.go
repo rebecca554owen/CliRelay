@@ -6,6 +6,35 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestResolveKimiUpstreamModel_UsesKimiCodeManagedModelForBuiltins(t *testing.T) {
+	for _, model := range []string{
+		"kimi-k2",
+		"kimi-k2-thinking",
+		"kimi-k2-thinking-turbo",
+		"kimi-k2.5",
+		"kimi-k2.6",
+		"kimi-k2-0711-preview",
+		"kimi-k2-0905-preview",
+		"kimi-k2-turbo-preview",
+	} {
+		if got := resolveKimiUpstreamModel(model); got != "kimi-for-coding" {
+			t.Fatalf("resolveKimiUpstreamModel(%q) = %q, want %q", model, got, "kimi-for-coding")
+		}
+	}
+}
+
+func TestResolveKimiUpstreamModel_PreservesKimiForCodingAndCustomModels(t *testing.T) {
+	for _, model := range []string{
+		"kimi-for-coding",
+		"moonshot-v1-128k",
+		"custom-kimi-model",
+	} {
+		if got := resolveKimiUpstreamModel(model); got != model {
+			t.Fatalf("resolveKimiUpstreamModel(%q) = %q, want %q", model, got, model)
+		}
+	}
+}
+
 func TestNormalizeKimiToolMessageLinks_UsesCallIDFallback(t *testing.T) {
 	body := []byte(`{
 		"messages":[
