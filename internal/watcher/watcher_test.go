@@ -66,7 +66,7 @@ func TestBuildAPIKeyClientsCounts(t *testing.T) {
 		VertexCompatAPIKey: []config.VertexCompatKey{
 			{APIKey: "v1"},
 		},
-		ClaudeKey: []config.ClaudeKey{{APIKey: "c1"}},
+		ClaudeKey: []config.ClaudeKey{{APIKey: "c1"}, {APIKey: "c2", Disabled: true}},
 		CodexKey:  []config.CodexKey{{APIKey: "x1"}, {APIKey: "x2"}},
 		BedrockKey: []config.BedrockKey{
 			{AuthMode: "api-key", APIKey: "b1"},
@@ -74,7 +74,8 @@ func TestBuildAPIKeyClientsCounts(t *testing.T) {
 		},
 		OpenCodeGoKey: []config.OpenCodeGoKey{{APIKey: "go1"}},
 		OpenAICompatibility: []config.OpenAICompatibility{
-			{APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "o1"}, {APIKey: "o2"}}},
+			{APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "o1"}, {APIKey: "o2"}, {APIKey: "o3", Disabled: true}}},
+			{Disabled: true, APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "disabled-provider"}}},
 		},
 	}
 

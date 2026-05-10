@@ -485,6 +485,9 @@ type ClaudeKey struct {
 	// APIKey is the authentication key for accessing Claude API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
+	// Disabled marks this Claude-compatible key as inactive without removing it.
+	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
+
 	// Name is a human-readable label for this channel.
 	Name string `yaml:"name,omitempty" json:"name,omitempty"`
 

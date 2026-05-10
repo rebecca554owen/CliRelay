@@ -203,6 +203,31 @@ func TestConfigSynthesizer_ClaudeKeys(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_ClaudeKeys_SkipsDisabled(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			ClaudeKey: []config.ClaudeKey{
+				{APIKey: "disabled-key", Disabled: true, BaseURL: "https://api.kimi.com/coding"},
+				{APIKey: "active-key", BaseURL: "https://api.anthropic.com"},
+			},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 active auth, got %d", len(auths))
+	}
+	if got := auths[0].Attributes["api_key"]; got != "active-key" {
+		t.Fatalf("expected active key only, got %q", got)
+	}
+}
+
 func TestConfigSynthesizer_ClaudeKeys_SkipsEmptyAndHeaders(t *testing.T) {
 	synth := NewConfigSynthesizer()
 	ctx := &SynthesisContext{

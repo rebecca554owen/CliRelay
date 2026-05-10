@@ -263,7 +263,11 @@ func BuildAPIKeyClients(cfg *config.Config) (int, int, int, int, int, int, int) 
 		vertexCompatAPIKeyCount += len(cfg.VertexCompatAPIKey)
 	}
 	if len(cfg.ClaudeKey) > 0 {
-		claudeAPIKeyCount += len(cfg.ClaudeKey)
+		for _, entry := range cfg.ClaudeKey {
+			if !entry.Disabled {
+				claudeAPIKeyCount++
+			}
+		}
 	}
 	if len(cfg.CodexKey) > 0 {
 		codexAPIKeyCount += len(cfg.CodexKey)
@@ -276,7 +280,17 @@ func BuildAPIKeyClients(cfg *config.Config) (int, int, int, int, int, int, int) 
 	}
 	if len(cfg.OpenAICompatibility) > 0 {
 		for _, compatConfig := range cfg.OpenAICompatibility {
-			openAICompatCount += len(compatConfig.APIKeyEntries)
+			if compatConfig.Disabled {
+				continue
+			}
+			for _, entry := range compatConfig.APIKeyEntries {
+				if !entry.Disabled {
+					openAICompatCount++
+				}
+			}
+			if len(compatConfig.APIKeyEntries) == 0 {
+				openAICompatCount++
+			}
 		}
 	}
 	return geminiAPIKeyCount, vertexCompatAPIKeyCount, claudeAPIKeyCount, codexAPIKeyCount, bedrockAPIKeyCount, openCodeGoAPIKeyCount, openAICompatCount

@@ -106,6 +106,9 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 	out := make([]*coreauth.Auth, 0, len(cfg.ClaudeKey))
 	for i := range cfg.ClaudeKey {
 		ck := cfg.ClaudeKey[i]
+		if ck.Disabled {
+			continue
+		}
 		key := strings.TrimSpace(ck.APIKey)
 		if key == "" {
 			continue
