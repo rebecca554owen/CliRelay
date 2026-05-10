@@ -687,6 +687,7 @@ func TestCodexExecutorExecuteImageGenerationReturnsResponsesFailedRateLimit(t *t
 }
 
 func TestUsageReporterTrackFailureStoresErrorContent(t *testing.T) {
+	const model = "gpt-image-failure-content"
 	usagePlugin := &usageCapturePlugin{records: make(chan cliproxyusage.Record, 8)}
 	cliproxyusage.RegisterPlugin(usagePlugin)
 
@@ -695,8 +696,8 @@ func TestUsageReporterTrackFailureStoresErrorContent(t *testing.T) {
 		Provider: "codex",
 		Status:   cliproxyauth.StatusActive,
 	}
-	reporter := newUsageReporter(context.Background(), "codex", "gpt-image-2", auth)
-	reporter.setInputContent(`{"model":"gpt-image-2","prompt":"draw a fox"}`)
+	reporter := newUsageReporter(context.Background(), "codex", model, auth)
+	reporter.setInputContent(`{"model":"` + model + `","prompt":"draw a fox"}`)
 	errValue := fmt.Errorf("openai image conversation returned no downloadable images")
 
 	reporter.trackFailure(context.Background(), &errValue)
@@ -708,7 +709,7 @@ func TestUsageReporterTrackFailureStoresErrorContent(t *testing.T) {
 			if record.AuthID != auth.ID {
 				continue
 			}
-			if record.Model != "gpt-image-2" {
+			if record.Model != model {
 				continue
 			}
 			if !record.Failed {
