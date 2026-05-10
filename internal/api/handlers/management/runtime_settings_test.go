@@ -147,3 +147,46 @@ func TestPutProviderCredentialsPersistToSQLite(t *testing.T) {
 		t.Fatalf("ordinary config should remain in YAML:\n%s", string(data))
 	}
 }
+
+func TestPutCodexKeysPersistsToSQLiteAndInvokesMutationHook(t *testing.T) {
+	initManagementModelsTestDB(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("codex-api-key:\n  - api-key: old-codex\n    base-url: https://old.example.com\nlogging-to-file: true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg := &config.Config{LoggingToFile: true}
+	h := NewHandler(cfg, configPath, nil)
+
+	mutationCalls := 0
+	h.SetConfigMutatedHook(func(updated *config.Config) {
+		mutationCalls++
+		if updated == nil || len(updated.CodexKey) != 1 {
+			t.Fatalf("unexpected updated config in mutation hook: %#v", updated)
+		}
+		if updated.CodexKey[0].APIKey != "sk-codex-db" || updated.CodexKey[0].BaseURL != "https://codex.example.com" {
+			t.Fatalf("unexpected codex key in mutation hook: %#v", updated.CodexKey)
+		}
+	})
+
+	rec := performModelsRequest(http.MethodPut, "/codex-api-key", []byte(`[
+		{"api-key": "sk-codex-db", "base-url": "https://codex.example.com"}
+	]`), h.PutCodexKeys)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PutCodexKeys status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if mutationCalls != 1 {
+		t.Fatalf("mutation hook calls = %d, want 1", mutationCalls)
+	}
+	if len(cfg.CodexKey) != 1 || cfg.CodexKey[0].APIKey != "sk-codex-db" {
+		t.Fatalf("cfg codex keys = %#v", cfg.CodexKey)
+	}
+
+	var stored config.Config
+	if !usage.ApplyStoredRuntimeSettings(&stored) {
+		t.Fatal("ApplyStoredRuntimeSettings returned false")
+	}
+	if len(stored.CodexKey) != 1 || stored.CodexKey[0].APIKey != "sk-codex-db" {
+		t.Fatalf("stored codex keys = %#v", stored.CodexKey)
+	}
+}

@@ -22,6 +22,41 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
+func performManagementRequest(method string, path string, body []byte, handler gin.HandlerFunc) *httptest.ResponseRecorder {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	if body == nil {
+		c.Request = httptest.NewRequest(method, path, nil)
+	} else {
+		c.Request = httptest.NewRequest(method, path, strings.NewReader(string(body)))
+		c.Request.Header.Set("Content-Type", "application/json")
+	}
+	handler(c)
+	return rec
+}
+
+func countConfigDerivedOpenAICompatAuths(items []*auth.Auth) (active int, disabled int) {
+	for _, item := range items {
+		if item == nil || item.Attributes == nil {
+			continue
+		}
+		source := strings.ToLower(strings.TrimSpace(item.Attributes["source"]))
+		if !strings.HasPrefix(source, "config:") {
+			continue
+		}
+		if strings.TrimSpace(item.Attributes["compat_name"]) == "" && strings.TrimSpace(item.Attributes["provider_key"]) == "" {
+			continue
+		}
+		if item.Disabled || item.Status == auth.StatusDisabled {
+			disabled++
+			continue
+		}
+		active++
+	}
+	return active, disabled
+}
+
 type deadlineTrackingWriter struct {
 	gin.ResponseWriter
 	deadlines []time.Time
@@ -99,6 +134,9 @@ func newTestServerWithConfig(t *testing.T, configure func(*proxyconfig.Config)) 
 	accessManager := sdkaccess.NewManager()
 
 	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("failed to create config file: %v", err)
+	}
 	return NewServer(cfg, authManager, accessManager, configPath)
 }
 
@@ -206,6 +244,148 @@ func TestGroupedNestedV1RouteConfigured(t *testing.T) {
 	}
 }
 
+func TestUpdateClientsDisablesRemovedConfigAuths(t *testing.T) {
+	server := newTestServer(t)
+	manager := server.handlers.AuthManager
+	ctx := context.Background()
+
+	for _, seed := range []*auth.Auth{
+		{
+			ID:       "claude-config-auth",
+			Provider: "claude",
+			Label:    "Claude API key",
+			Status:   auth.StatusActive,
+			Attributes: map[string]string{
+				"source":  "config:claude[old]",
+				"api_key": "sk-claude-old",
+			},
+		},
+		{
+			ID:       "kimi-config-auth",
+			Provider: "kimi",
+			Label:    "Kimi API key",
+			Status:   auth.StatusActive,
+			Attributes: map[string]string{
+				"source":       "config:kimi[old]",
+				"api_key":      "sk-kimi-old",
+				"compat_name":  "Kimi",
+				"provider_key": "kimi",
+			},
+		},
+	} {
+		if _, err := manager.Register(ctx, seed); err != nil {
+			t.Fatalf("register auth %s: %v", seed.ID, err)
+		}
+	}
+
+	next := *server.cfg
+	next.ClaudeKey = nil
+	server.UpdateClients(&next)
+
+	for _, id := range []string{"claude-config-auth", "kimi-config-auth"} {
+		updated, ok := manager.GetByID(id)
+		if !ok {
+			t.Fatalf("expected existing auth %s to remain as disabled runtime state", id)
+		}
+		if !updated.Disabled || updated.Status != auth.StatusDisabled {
+			t.Fatalf("%s should be disabled after removal, got disabled=%t status=%s", id, updated.Disabled, updated.Status)
+		}
+	}
+}
+
+func TestManagementSaveHotAppliesOpenAICompatStateWithoutWatcher(t *testing.T) {
+	server := newTestServerWithConfig(t, func(cfg *proxyconfig.Config) {
+		cfg.OpenAICompatibility = []proxyconfig.OpenAICompatibility{
+			{
+				Name:    "OpenAI Main",
+				BaseURL: "https://example.com/v1",
+				APIKeyEntries: []proxyconfig.OpenAICompatibilityAPIKey{
+					{APIKey: "sk-openai-a"},
+					{APIKey: "sk-openai-b"},
+				},
+				Models: []proxyconfig.OpenAICompatibilityModel{{Name: "gpt-4.1"}},
+			},
+		}
+		cfg.SanitizeOpenAICompatibility()
+	})
+	server.UpdateClients(server.cfg)
+
+	activeBefore, disabledBefore := countConfigDerivedOpenAICompatAuths(server.handlers.AuthManager.List())
+	if activeBefore == 0 || disabledBefore != 0 {
+		t.Fatalf("expected active openai-compat auths before toggle, got active=%d disabled=%d", activeBefore, disabledBefore)
+	}
+
+	hookCalls := 0
+	server.SetPostConfigMutationHook(func(updated *proxyconfig.Config) {
+		hookCalls++
+		if updated == nil || len(updated.OpenAICompatibility) != 1 {
+			t.Fatalf("unexpected updated config in post hook: %#v", updated)
+		}
+		entries := updated.OpenAICompatibility[0].APIKeyEntries
+		if len(entries) != 2 || !entries[0].Disabled || !entries[1].Disabled {
+			t.Fatalf("expected post hook to observe disabled entries, got %#v", entries)
+		}
+	})
+
+	disableBody := []byte(`[
+		{
+			"name": "OpenAI Main",
+			"base-url": "https://example.com/v1",
+			"api-key-entries": [
+				{"api-key": "sk-openai-a", "disabled": true},
+				{"api-key": "sk-openai-b", "disabled": true}
+			],
+			"models": [{"name": "gpt-4.1"}]
+		}
+	]`)
+	rec := performManagementRequest(http.MethodPut, "/openai-compatibility", disableBody, server.mgmt.PutOpenAICompat)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if hookCalls != 1 {
+		t.Fatalf("post hook calls after disable = %d, want 1", hookCalls)
+	}
+
+	activeAfterDisable, disabledAfterDisable := countConfigDerivedOpenAICompatAuths(server.handlers.AuthManager.List())
+	if activeAfterDisable != 0 || disabledAfterDisable == 0 {
+		t.Fatalf("expected hot-disabled compat auths after save, got active=%d disabled=%d", activeAfterDisable, disabledAfterDisable)
+	}
+
+	server.SetPostConfigMutationHook(func(updated *proxyconfig.Config) {
+		hookCalls++
+		if updated == nil || len(updated.OpenAICompatibility) != 1 {
+			t.Fatalf("unexpected updated config in enable hook: %#v", updated)
+		}
+		entries := updated.OpenAICompatibility[0].APIKeyEntries
+		if len(entries) != 2 || entries[0].Disabled || !entries[1].Disabled {
+			t.Fatalf("expected post hook to observe one re-enabled entry, got %#v", entries)
+		}
+	})
+
+	enableBody := []byte(`[
+		{
+			"name": "OpenAI Main",
+			"base-url": "https://example.com/v1",
+			"api-key-entries": [
+				{"api-key": "sk-openai-a"},
+				{"api-key": "sk-openai-b", "disabled": true}
+			],
+			"models": [{"name": "gpt-4.1"}]
+		}
+	]`)
+	rec = performManagementRequest(http.MethodPut, "/openai-compatibility", enableBody, server.mgmt.PutOpenAICompat)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enable status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if hookCalls != 2 {
+		t.Fatalf("post hook calls after re-enable = %d, want 2", hookCalls)
+	}
+
+	activeAfterEnable, _ := countConfigDerivedOpenAICompatAuths(server.handlers.AuthManager.List())
+	if activeAfterEnable == 0 {
+		t.Fatal("expected at least one active compat auth after re-enable")
+	}
+}
 func TestGroupedV1RouteForbiddenByAPIKeyGroups(t *testing.T) {
 	server := newTestServerWithConfig(t, func(cfg *proxyconfig.Config) {
 		cfg.SDKConfig.APIKeys = nil

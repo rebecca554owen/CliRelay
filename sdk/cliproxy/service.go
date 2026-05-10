@@ -353,6 +353,63 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval)
 }
 
+func (s *Service) applyRuntimeConfig(cfg *config.Config, skipServerUpdate bool) {
+	if s == nil {
+		return
+	}
+
+	previousStrategy := ""
+	s.cfgMu.RLock()
+	if s.cfg != nil {
+		previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+	}
+	s.cfgMu.RUnlock()
+
+	if cfg == nil {
+		s.cfgMu.RLock()
+		cfg = s.cfg
+		s.cfgMu.RUnlock()
+	}
+	if cfg == nil {
+		return
+	}
+
+	internalusage.MigrateRoutingConfigFromConfig(cfg, s.configPath)
+	internalusage.ApplyStoredRoutingConfig(cfg)
+	internalusage.MigrateProxyPoolFromConfig(cfg, s.configPath)
+	internalusage.ApplyStoredProxyPool(cfg)
+	internalusage.MigrateRuntimeSettingsFromConfig(cfg, s.configPath)
+	internalusage.ApplyStoredRuntimeSettings(cfg)
+
+	nextStrategy := strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy))
+	previousStrategy = config.NormalizeRoutingStrategy(previousStrategy)
+	nextStrategy = config.NormalizeRoutingStrategy(nextStrategy)
+	if s.coreManager != nil && previousStrategy != nextStrategy {
+		var selector coreauth.Selector
+		switch nextStrategy {
+		case "fill-first":
+			selector = &coreauth.FillFirstSelector{}
+		default:
+			selector = &coreauth.RoundRobinSelector{}
+		}
+		s.coreManager.SetSelector(selector)
+	}
+
+	s.applyRetryConfig(cfg)
+	s.applyPprofConfig(cfg)
+	if !skipServerUpdate && s.server != nil {
+		s.server.UpdateClients(cfg)
+	}
+	s.cfgMu.Lock()
+	s.cfg = cfg
+	s.cfgMu.Unlock()
+	if s.coreManager != nil {
+		s.coreManager.SetConfig(cfg)
+		s.coreManager.SetOAuthModelAlias(cfg.OAuthModelAlias)
+	}
+	s.rebindExecutors()
+}
+
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
 	if a == nil {
 		return "", "", false
@@ -525,6 +582,11 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+	if s.server != nil {
+		s.server.SetPostConfigMutationHook(func(updated *config.Config) {
+			s.applyRuntimeConfig(updated, true)
+		})
+	}
 
 	if s.authManager == nil {
 		s.authManager = newDefaultAuthManager()
@@ -579,55 +641,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
-		previousStrategy := ""
-		s.cfgMu.RLock()
-		if s.cfg != nil {
-			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
-		}
-		s.cfgMu.RUnlock()
-
-		if newCfg == nil {
-			s.cfgMu.RLock()
-			newCfg = s.cfg
-			s.cfgMu.RUnlock()
-		}
-		if newCfg == nil {
-			return
-		}
-		internalusage.MigrateRoutingConfigFromConfig(newCfg, s.configPath)
-		internalusage.ApplyStoredRoutingConfig(newCfg)
-		internalusage.MigrateProxyPoolFromConfig(newCfg, s.configPath)
-		internalusage.ApplyStoredProxyPool(newCfg)
-		internalusage.MigrateRuntimeSettingsFromConfig(newCfg, s.configPath)
-		internalusage.ApplyStoredRuntimeSettings(newCfg)
-
-		nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
-		previousStrategy = config.NormalizeRoutingStrategy(previousStrategy)
-		nextStrategy = config.NormalizeRoutingStrategy(nextStrategy)
-		if s.coreManager != nil && previousStrategy != nextStrategy {
-			var selector coreauth.Selector
-			switch nextStrategy {
-			case "fill-first":
-				selector = &coreauth.FillFirstSelector{}
-			default:
-				selector = &coreauth.RoundRobinSelector{}
-			}
-			s.coreManager.SetSelector(selector)
-		}
-
-		s.applyRetryConfig(newCfg)
-		s.applyPprofConfig(newCfg)
-		if s.server != nil {
-			s.server.UpdateClients(newCfg)
-		}
-		s.cfgMu.Lock()
-		s.cfg = newCfg
-		s.cfgMu.Unlock()
-		if s.coreManager != nil {
-			s.coreManager.SetConfig(newCfg)
-			s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
-		}
-		s.rebindExecutors()
+		s.applyRuntimeConfig(newCfg, false)
 	}
 
 	watcherWrapper, err = s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
