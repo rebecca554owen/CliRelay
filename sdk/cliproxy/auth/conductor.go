@@ -1856,7 +1856,7 @@ func isRequestInvalidError(err error) bool {
 	if message == "" {
 		return false
 	}
-	if isKimiAccountAvailabilityMessage(message) {
+	if isAccountAvailabilityMessage(message) {
 		return false
 	}
 	if strings.Contains(message, "invalid_request_error") {
@@ -2002,33 +2002,78 @@ func providerAccountCooldown(provider string, resultErr *Error, auth *Auth) (tim
 	if resultErr == nil || quotaCooldownDisabledForAuth(auth) {
 		return 0, "", false
 	}
-	if !strings.EqualFold(strings.TrimSpace(provider), "kimi") {
+	if cooldown, reason, quota := accountCooldownForMessage(resultErr.Message); cooldown > 0 {
+		return cooldown, reason, quota
+	}
+	switch statusCodeFromResult(resultErr) {
+	case http.StatusUnauthorized:
+		return 30 * time.Minute, "unauthorized", false
+	case http.StatusPaymentRequired, http.StatusForbidden:
+		return 30 * time.Minute, "payment_required", false
+	default:
 		return 0, "", false
 	}
-	return kimiAccountCooldownForMessage(resultErr.Message)
 }
 
-func kimiAccountCooldownForMessage(message string) (time.Duration, string, bool) {
+func accountCooldownForMessage(message string) (time.Duration, string, bool) {
 	message = strings.ToLower(message)
+	if isRequestScopeFailureMessage(message) {
+		return 0, "", false
+	}
 	switch {
 	case strings.Contains(message, "access_terminated_error"),
 		strings.Contains(message, "usage limit for this billing cycle"),
-		strings.Contains(message, "quota will be refreshed"):
+		strings.Contains(message, "quota will be refreshed"),
+		strings.Contains(message, "monthly usage quota"),
+		strings.Contains(message, "weekly usage limit reached"),
+		strings.Contains(message, "accountquotaexceeded"):
 		return 12 * time.Hour, "quota", true
+	case strings.Contains(message, "usage limit exceeded"),
+		strings.Contains(message, "rate_limit_error"),
+		strings.Contains(message, "rate limit"),
+		strings.Contains(message, "quota exhausted"),
+		strings.Contains(message, "quota exceeded"):
+		return 30 * time.Minute, "quota", true
 	case strings.Contains(message, "membership benefits"),
 		strings.Contains(message, "membership is active"),
 		strings.Contains(message, "invalid_authentication_error"),
 		strings.Contains(message, "api key appears to be invalid"),
-		strings.Contains(message, "verify your credentials"):
+		strings.Contains(message, "verify your credentials"),
+		strings.Contains(message, "authentication_error"),
+		strings.Contains(message, "invalid api key"),
+		strings.Contains(message, "invalid_api_key"),
+		strings.Contains(message, "invalid access token"),
+		strings.Contains(message, "token expired"),
+		strings.Contains(message, "token has expired"),
+		strings.Contains(message, "account has been banned"),
+		strings.Contains(message, "service is now terminated"),
+		strings.Contains(message, "service terminated"):
 		return 30 * time.Minute, "unauthorized", false
 	default:
 		return 0, "", false
 	}
 }
 
-func isKimiAccountAvailabilityMessage(message string) bool {
-	cooldown, _, _ := kimiAccountCooldownForMessage(message)
+func isAccountAvailabilityMessage(message string) bool {
+	cooldown, _, _ := accountCooldownForMessage(message)
 	return cooldown > 0
+}
+
+func isRequestScopeFailureMessage(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	if message == "" {
+		return false
+	}
+	return strings.Contains(message, "context window exceeds limit") ||
+		strings.Contains(message, "context length exceeded") ||
+		strings.Contains(message, "maximum context length") ||
+		strings.Contains(message, "message 0 content must not be empty") ||
+		strings.Contains(message, "content must not be empty") ||
+		strings.Contains(message, "role 'assistant' must not be empty") ||
+		strings.Contains(message, "messages must") ||
+		strings.Contains(message, "model is not supported") ||
+		strings.Contains(message, "model not supported") ||
+		strings.Contains(message, "not supported when using codex with a chatgpt account")
 }
 
 func providerTransientAccountCooldown(provider string, statusCode int) bool {

@@ -753,7 +753,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 }
 
 func accountUnavailableBlocksAllModels(auth *Auth) bool {
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "kimi") {
+	if auth == nil {
 		return false
 	}
 	message := strings.ToLower(strings.TrimSpace(auth.StatusMessage))
@@ -762,5 +762,6 @@ func accountUnavailableBlocksAllModels(auth *Auth) bool {
 	}
 	return strings.Contains(message, "unauthorized") ||
 		strings.Contains(message, "transient upstream error") ||
-		isKimiAccountAvailabilityMessage(message)
+		strings.Contains(message, "payment_required") ||
+		isAccountAvailabilityMessage(message)
 }
