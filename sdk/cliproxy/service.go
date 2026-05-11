@@ -353,11 +353,10 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval)
 }
 
-func (s *Service) applyRuntimeConfig(cfg *config.Config, skipServerUpdate bool) {
+func (s *Service) applyConfigReload(newCfg *config.Config, refreshRegisteredModels bool) {
 	if s == nil {
 		return
 	}
-
 	previousStrategy := ""
 	s.cfgMu.RLock()
 	if s.cfg != nil {
@@ -365,23 +364,22 @@ func (s *Service) applyRuntimeConfig(cfg *config.Config, skipServerUpdate bool) 
 	}
 	s.cfgMu.RUnlock()
 
-	if cfg == nil {
+	if newCfg == nil {
 		s.cfgMu.RLock()
-		cfg = s.cfg
+		newCfg = s.cfg
 		s.cfgMu.RUnlock()
 	}
-	if cfg == nil {
+	if newCfg == nil {
 		return
 	}
+	internalusage.MigrateRoutingConfigFromConfig(newCfg, s.configPath)
+	internalusage.ApplyStoredRoutingConfig(newCfg)
+	internalusage.MigrateProxyPoolFromConfig(newCfg, s.configPath)
+	internalusage.ApplyStoredProxyPool(newCfg)
+	internalusage.MigrateRuntimeSettingsFromConfig(newCfg, s.configPath)
+	internalusage.ApplyStoredRuntimeSettings(newCfg)
 
-	internalusage.MigrateRoutingConfigFromConfig(cfg, s.configPath)
-	internalusage.ApplyStoredRoutingConfig(cfg)
-	internalusage.MigrateProxyPoolFromConfig(cfg, s.configPath)
-	internalusage.ApplyStoredProxyPool(cfg)
-	internalusage.MigrateRuntimeSettingsFromConfig(cfg, s.configPath)
-	internalusage.ApplyStoredRuntimeSettings(cfg)
-
-	nextStrategy := strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy))
+	nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
 	previousStrategy = config.NormalizeRoutingStrategy(previousStrategy)
 	nextStrategy = config.NormalizeRoutingStrategy(nextStrategy)
 	if s.coreManager != nil && previousStrategy != nextStrategy {
@@ -395,19 +393,27 @@ func (s *Service) applyRuntimeConfig(cfg *config.Config, skipServerUpdate bool) 
 		s.coreManager.SetSelector(selector)
 	}
 
-	s.applyRetryConfig(cfg)
-	s.applyPprofConfig(cfg)
-	if !skipServerUpdate && s.server != nil {
-		s.server.UpdateClients(cfg)
+	s.applyRetryConfig(newCfg)
+	s.applyPprofConfig(newCfg)
+	if s.server != nil {
+		s.server.UpdateClients(newCfg)
 	}
 	s.cfgMu.Lock()
-	s.cfg = cfg
+	s.cfg = newCfg
 	s.cfgMu.Unlock()
+	if s.watcher != nil {
+		s.watcher.SetConfig(newCfg)
+	}
 	if s.coreManager != nil {
-		s.coreManager.SetConfig(cfg)
-		s.coreManager.SetOAuthModelAlias(cfg.OAuthModelAlias)
+		s.coreManager.SetConfig(newCfg)
+		s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
 	}
 	s.rebindExecutors()
+	if refreshRegisteredModels && s.coreManager != nil {
+		for _, auth := range s.coreManager.List() {
+			s.registerModelsForAuth(context.Background(), auth)
+		}
+	}
 }
 
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
@@ -581,12 +587,11 @@ func (s *Service) Run(ctx context.Context) error {
 	// legacy clients removed; no caches to refresh
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
-	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
-	if s.server != nil {
-		s.server.SetPostConfigMutationHook(func(updated *config.Config) {
-			s.applyRuntimeConfig(updated, true)
-		})
-	}
+	serverOptions := append([]api.ServerOption(nil), s.serverOptions...)
+	serverOptions = append(serverOptions, api.WithConfigMutatedCallback(func(updated *config.Config) {
+		s.applyConfigReload(updated, true)
+	}))
+	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, serverOptions...)
 
 	if s.authManager == nil {
 		s.authManager = newDefaultAuthManager()
@@ -641,7 +646,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
-		s.applyRuntimeConfig(newCfg, false)
+		s.applyConfigReload(newCfg, false)
 	}
 
 	watcherWrapper, err = s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
