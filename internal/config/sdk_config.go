@@ -47,6 +47,15 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+
+	// InsecureSkipVerify disables TLS certificate verification for upstream HTTPS connections.
+	// When true, the proxy will accept any certificate presented by upstream servers.
+	// This is insecure and should only be used in testing or trusted internal networks.
+	InsecureSkipVerify bool `yaml:"insecure-skip-verify" json:"insecure-skip-verify"`
+
+	// CACert is the path to a PEM-encoded CA certificate file used to verify upstream server certificates.
+	// When empty, the system default root CA pool is used.
+	CACert string `yaml:"ca-cert" json:"ca-cert"`
 }
 
 // RequestLogStorageConfig controls retention and cleanup of full request/response bodies.
